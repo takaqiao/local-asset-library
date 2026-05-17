@@ -93,9 +93,7 @@ function makeFolderPath(asset) {
 }
 
 const INDEX_CACHE_FILE = "_lal_index.json";
-const INDEX_VERSION = 2;
-
-const PACK_VERSION_RE = /^(.+?)-\d+(?:\.\d+){1,2}$/;
+const INDEX_VERSION = 3;
 
 // ---------- Scanner ----------
 class LalScanner {
@@ -173,22 +171,7 @@ class LalScanner {
       try { packsBrowse = await FilePicker.browse("data", creatorDir); }
       catch (e) { console.warn(`[${MODULE_ID}] 跳过 ${creatorDir}:`, e); continue; }
 
-      // 识别 pack 版本变体: 凡 pack 名为 <base>-<x.y[.z]> 且 <base> pack 也存在,
-      // 就跳过变体 pack(它们和主 pack 内容基本重复,thumb 也大概率没下到)
-      const _allPackNames = packsBrowse.dirs.map(p => p.split("/").filter(Boolean).pop());
-      const _basePacks = new Set(_allPackNames.filter(n => !PACK_VERSION_RE.test(n)));
-      const _skipVariants = new Set();
-      for (const name of _allPackNames) {
-        const m = PACK_VERSION_RE.exec(name);
-        if (m && _basePacks.has(m[1])) _skipVariants.add(name);
-      }
-      if (_skipVariants.size) {
-        console.log(`[${MODULE_ID}] ${creatorDir.split("/").pop()}: 跳过 ${_skipVariants.size} 个版本变体 pack`);
-      }
-
       for (const packDir of packsBrowse.dirs) {
-        const _packName = packDir.split("/").filter(Boolean).pop();
-        if (_skipVariants.has(_packName)) continue;
         nPacks++;
         let packBrowse;
         try { packBrowse = await FilePicker.browse("data", packDir); }
