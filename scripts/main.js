@@ -342,6 +342,19 @@ async function importReferencedDocs(refIds, packPath, docName) {
   return imported;
 }
 
+function isBlankSceneTemplate(parsed) {
+  const tiles = (parsed.tiles || []).length;
+  const walls = (parsed.walls || []).length;
+  const lights = (parsed.lights || []).length;
+  const tokens = (parsed.tokens || []).length;
+  const notes = (parsed.notes || []).length;
+  const drawings = (parsed.drawings || []).length;
+  const bg = parsed.background?.src;
+  // 完全空: 0 of everything, no bg, often no dims
+  return tiles === 0 && walls === 0 && lights === 0 && tokens === 0 &&
+         notes === 0 && drawings === 0 && !bg;
+}
+
 async function importSceneJSON(text, asset) {
   const cls = CONFIG.Scene.documentClass;
   const parsed = safeJsonParse(text, asset?._localPath);
@@ -349,6 +362,15 @@ async function importSceneJSON(text, asset) {
   if (parsed.thumb) {
     console.log(`[${MODULE_ID}] 移除指向不可达资源的 thumb: ${parsed.thumb}`);
     delete parsed.thumb;
+  }
+
+  // MAD 等大量内容包带很多空模板 scene (例如 mad-xxx-12.0.1 系列),
+  // 这些 0 tile/wall/light/bg 的 scene import 进去就是个空壳, 直接拒绝
+  if (isBlankSceneTemplate(parsed)) {
+    const sceneName = parsed.name || asset?.filepath || "未知";
+    console.warn(`[${MODULE_ID}] 跳过空 scene 模板: ${sceneName}`);
+    ui.notifications.warn(`"${sceneName}" 是空模板 (无 tiles/walls/bg), 已跳过`);
+    return null;
   }
 
   // 只 import scene 真正引用的 journal/playlist/actor, 不创空 stub
