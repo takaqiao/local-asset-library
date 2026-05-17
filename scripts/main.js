@@ -370,11 +370,12 @@ async function importReferencedDocs(refIds, packPath, docName) {
 }
 
 // scene 分类: "empty" 全空 / "walls-only" 只有墙线无图 / "overlay" 透明图层 / "normal" 正常
-const OVERLAY_FILENAME_RE = /transparent|canopy|_roof|_topfr|_top_fr|foreground|_overlay/i;
+const OVERLAY_FILENAME_RE = /transparent|canopy|_roof|_topfr|_top_fr|foreground|_overlay|^thumb_/i;
+const SPLASH_PATH_RE = /\/Splash\//i;
 
 /**
  * 挑最合适的图当 thumb 源.
- * 优先 background.src; 否则按面积降序找第一个非 overlay 的 tile;
+ * 优先 background.src; 否则按面积降序找第一个非 overlay / splash 的 tile;
  * 都没有就用最大 tile (好歹有轮廓).
  */
 function pickThumbnailSource(scene) {
@@ -386,7 +387,9 @@ function pickThumbnailSource(scene) {
     ((b.width || 0) * (b.height || 0)) - ((a.width || 0) * (a.height || 0))
   );
   const opaque = sorted.find(t => {
-    const fname = (t.texture?.src || "").split("/").pop() || "";
+    const src = t.texture?.src || "";
+    if (SPLASH_PATH_RE.test(src)) return false;
+    const fname = src.split("/").pop() || "";
     return !OVERLAY_FILENAME_RE.test(fname);
   });
   return opaque?.texture?.src || sorted[0]?.texture?.src || null;
@@ -488,17 +491,43 @@ async function importSceneJSON(text, asset) {
   }
 
   if (game.settings.get(MODULE_ID, "genThumbnails")) {
-    const thumbSrc = pickThumbnailSource(scene);
-    if (thumbSrc) {
+    // 优先: download-thumbs.py 下到的 server thumb (asset.thumb 字段), 直接 set 不用 render
+    if (asset?._thumbLocal) {
       try {
-        const t = await scene.createThumbnail({ img: thumbSrc });
-        if (t?.thumb) await scene.update({ thumb: t.thumb });
-        console.log(`[${MODULE_ID}] 缩略图生成自: ${thumbSrc.split("/").pop()}`);
-      } catch (e) {
-        console.warn(`[${MODULE_ID}] 生成缩略图失败:`, e);
+        const probe = await fetch(asset._thumbLocal, { method: "HEAD" });
+        if (probe.ok) {
+          await scene.update({ thumb: asset._thumbLocal });
+          console.log(`[${MODULE_ID}] thumb 直接用 server-gen: ${asset._thumbLocal.split("/").pop()}`);
+        } else {
+          throw new Error(`thumb 404`);
+        }
+      } catch {
+        // server thumb 缺失, fallback 到 createThumbnail
+        const thumbSrc = pickThumbnailSource(scene);
+        if (thumbSrc) {
+          try {
+            const t = await scene.createThumbnail({ img: thumbSrc });
+            if (t?.thumb) await scene.update({ thumb: t.thumb });
+            console.log(`[${MODULE_ID}] thumb 生成自 tile: ${thumbSrc.split("/").pop()}`);
+          } catch (e) {
+            console.warn(`[${MODULE_ID}] createThumbnail 失败(源 ${thumbSrc.split("/").pop()}): ${e.message}`);
+          }
+        }
       }
     } else {
-      console.log(`[${MODULE_ID}] 无可用源图, 跳过 thumb`);
+      // 没 server thumb, 直接 createThumbnail
+      const thumbSrc = pickThumbnailSource(scene);
+      if (thumbSrc) {
+        try {
+          const t = await scene.createThumbnail({ img: thumbSrc });
+          if (t?.thumb) await scene.update({ thumb: t.thumb });
+          console.log(`[${MODULE_ID}] thumb 生成自 tile: ${thumbSrc.split("/").pop()}`);
+        } catch (e) {
+          console.warn(`[${MODULE_ID}] createThumbnail 失败(源 ${thumbSrc.split("/").pop()}): ${e.message}`);
+        }
+      } else {
+        console.log(`[${MODULE_ID}] 无可用源图, 跳过 thumb`);
+      }
     }
   }
 
