@@ -6,7 +6,7 @@
     </div>
   {{else}}
     <header class="lal-header">
-      <input class="lal-search" type="text" placeholder="搜文件名或合集..." value="{{searchQuery}}" />
+      <input class="lal-search" type="text" placeholder="搜文件名/合集/scene 名..." value="{{searchQuery}}" />
       <select class="lal-filter-type" title="资产类型">
         <option value="">全部类型</option>
         {{#each types}}<option value="{{id}}" {{#if selected}}selected{{/if}}>{{name}} ({{count}})</option>{{/each}}
@@ -18,14 +18,32 @@
       <select class="lal-filter-sort" title="排序">
         {{#each sortOptions}}<option value="{{id}}" {{#if selected}}selected{{/if}}>{{label}}</option>{{/each}}
       </select>
-      <button type="button" class="lal-toggle-select" title="切换多选" {{#if selectMode}}data-active="1"{{/if}}>
+      <button type="button" class="lal-toggle-favorites" title="只看收藏 ({{favoritesCount}} 个)" {{#if favoritesOnly}}data-active="1"{{/if}}>
+        <i class="fas fa-star"></i>
+      </button>
+      <button type="button" class="lal-toggle-select" title="多选" {{#if selectMode}}data-active="1"{{/if}}>
         <i class="fas fa-check-square"></i>
       </button>
-      <button type="button" class="lal-scan" title="重新扫描(无视缓存)"><i class="fas fa-sync"></i></button>
+      <button type="button" class="lal-scan" title="重扫(无视缓存)"><i class="fas fa-sync"></i></button>
     </header>
 
+    {{#if filterCreator}}
+    <div class="lal-subfilter">
+      <select class="lal-filter-pack" title="合集">
+        <option value="">{{filterCreator}} 全部合集</option>
+        {{#each packs}}<option value="{{name}}" {{#if selected}}selected{{/if}}>{{name}} ({{count}})</option>{{/each}}
+      </select>
+      {{#if subFolders.length}}
+      <select class="lal-filter-folder" title="子文件夹">
+        <option value="">全部子文件夹</option>
+        {{#each subFolders}}<option value="{{name}}" {{#if selected}}selected{{/if}}>{{name}}/</option>{{/each}}
+      </select>
+      {{/if}}
+    </div>
+    {{/if}}
+
     <div class="lal-stats">
-      <span>{{total}} 个匹配 · 显示 {{pageStart}}-{{pageEnd}}</span>
+      <span>{{total}} 个匹配 · 显示 {{pageStart}}-{{pageEnd}}{{#if favoritesOnly}} · 收藏模式{{/if}}</span>
       {{#if selectMode}}
         <span class="lal-select-bar">
           已选 <span class="lal-selected-count">{{selectedCount}}</span> ·
@@ -44,7 +62,7 @@
 
     <div class="lal-grid">
       {{#each assets}}
-        <div class="lal-tile {{#if isSelected}}lal-tile-selected{{/if}}"
+        <div class="lal-tile {{#if isSelected}}lal-tile-selected{{/if}} {{#if isFavorite}}lal-tile-fav{{/if}}"
              draggable="{{#unless ../selectMode}}true{{else}}false{{/unless}}"
              data-url="{{url}}" data-id="{{id}}"
              data-type="{{typeId}}" data-w="{{imgW}}" data-h="{{imgH}}"
@@ -65,6 +83,7 @@
                 <div class="lal-menu">
                   <button type="button" class="lal-action-import" title="导入到 Foundry"><i class="fas fa-file-import"></i></button>
                   <button type="button" class="lal-action-preview" title="预览"><i class="fas fa-eye"></i></button>
+                  <button type="button" class="lal-action-favorite" title="{{#if isFavorite}}取消收藏{{else}}收藏{{/if}}"><i class="fas {{#if isFavorite}}fa-star{{else}}fa-star-o far fa-star{{/if}}"></i></button>
                   <button type="button" class="lal-action-clipboard" title="复制本地路径"><i class="fas fa-copy"></i></button>
                 </div>
               </div>

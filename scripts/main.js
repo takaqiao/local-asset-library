@@ -223,18 +223,37 @@ class LalIndex {
     }
   }
 
-  search({ query = "", types = null, creators = null, sort = "name-asc" }) {
+  search({ query = "", types = null, creators = null, packs = null, folderPrefix = null,
+           favoritesOnly = false, favorites = null, sort = "name-asc" }) {
     let r = this.assets;
     if (types?.length) r = r.filter(a => types.includes(a._type ?? a.type));
     if (creators?.length) r = r.filter(a => creators.includes(a.pack?.creator));
+    if (packs?.length) r = r.filter(a => packs.includes(a.pack?.name));
+    if (folderPrefix) r = r.filter(a => (a.filepath || "").startsWith(folderPrefix));
+    if (favoritesOnly && favorites) {
+      r = r.filter(a => favorites.has(String(a._id)));
+    }
     if (query) {
       const q = query.toLowerCase();
       r = r.filter(a =>
         a.filepath?.toLowerCase().includes(q) ||
-        a.pack?.name?.toLowerCase().includes(q)
+        a.pack?.name?.toLowerCase().includes(q) ||
+        a.name?.toLowerCase().includes(q)
       );
     }
     return LalIndex.applySort(r, sort);
+  }
+
+  /** 从指定 creator + pack 的 asset filepath 提取所有第一层子目录 */
+  getFoldersForPack(creator, packName) {
+    const folders = new Set();
+    for (const a of this.assets) {
+      if (creator && a.pack?.creator !== creator) continue;
+      if (packName && a.pack?.name !== packName) continue;
+      const parts = (a.filepath || "").split("/");
+      if (parts.length > 1) folders.add(parts[0]);
+    }
+    return [...folders].sort();
   }
 
   static applySort(arr, mode) {
@@ -599,8 +618,15 @@ async function createTileFromAsset(asset, dropPos) {
   const sceneGrid = canvas.grid?.size || 100;
   const w = (asset.size?.width || 0) > 0 ? asset.size.width : sceneGrid;
   const h = (asset.size?.height || 0) > 0 ? asset.size.height : sceneGrid;
-  const x = (dropPos?.x ?? canvas.dimensions.width / 2) - w / 2;
-  const y = (dropPos?.y ?? canvas.dimensions.height / 2) - h / 2;
+  let cx = dropPos?.x ?? canvas.dimensions.width / 2;
+  let cy = dropPos?.y ?? canvas.dimensions.height / 2;
+  // snap-to-grid: 把 tile 中心点 round 到 grid
+  if (game.settings.get(MODULE_ID, "snapToGrid")) {
+    cx = Math.round(cx / sceneGrid) * sceneGrid;
+    cy = Math.round(cy / sceneGrid) * sceneGrid;
+  }
+  const x = cx - w / 2;
+  const y = cy - h / 2;
   const tileData = {
     texture: { src: url },
     x, y, width: w, height: h,
@@ -611,6 +637,130 @@ async function createTileFromAsset(asset, dropPos) {
   }
   const [tile] = await canvas.scene.createEmbeddedDocuments("Tile", [tileData]);
   return tile;
+}
+
+/** 图作 Note (journal pin): 创建一个临时 JournalEntry 然后 Note 引用它 */
+async function createNoteFromImage(asset, dropPos) {
+  if (!canvas?.scene) throw new Error("当前没有打开任何场景");
+  const name = asset?.name || asset?.filepath?.split("/").pop()?.replace(/\.[^.]+$/, "") || "Note";
+  const folder = await getOrCreateFolder("JournalEntry", makeFolderPath(asset));
+  const journal = await JournalEntry.create({
+    name, folder: folder?.id || null,
+    pages: [{ name, type: "text", text: { content: "" } }],
+  });
+  const sceneGrid = canvas.grid?.size || 100;
+  let cx = dropPos?.x ?? canvas.dimensions.width / 2;
+  let cy = dropPos?.y ?? canvas.dimensions.height / 2;
+  if (game.settings.get(MODULE_ID, "snapToGrid")) {
+    cx = Math.round(cx / sceneGrid) * sceneGrid;
+    cy = Math.round(cy / sceneGrid) * sceneGrid;
+  }
+  const [note] = await canvas.scene.createEmbeddedDocuments("Note", [{
+    entryId: journal.id, x: cx, y: cy,
+    icon: asset._localPath, iconSize: 64, text: name,
+  }]);
+  return note;
+}
+
+/** 图作 Token: 弹 Dialog 选 Actor 类型, 创建临时 Actor 用此图当 token 头像 */
+async function createTokenFromImage(asset, dropPos) {
+  if (!canvas?.scene) throw new Error("当前没有打开任何场景");
+  const actorTypes = Object.keys(CONFIG.Actor?.dataModels || {});
+  const defaultType = actorTypes[0] || "base";
+  const name = asset?.name || asset?.filepath?.split("/").pop()?.replace(/\.[^.]+$/, "") || "Token";
+  const options = actorTypes.map(t => `<option value="${t}">${t}</option>`).join("");
+  return new Promise((resolve) => {
+    new Dialog({
+      title: "拖图作 Token",
+      content: `
+        <form>
+          <div class="form-group"><label>Actor 类型:</label>
+            <select name="actorType">${options || `<option value="${defaultType}">${defaultType}</option>`}</select>
+          </div>
+          <div class="form-group"><label>名字:</label>
+            <input type="text" name="name" value="${name}" />
+          </div>
+        </form>`,
+      buttons: {
+        create: {
+          icon: '<i class="fas fa-check"></i>', label: "创建",
+          callback: async (html) => {
+            const at = html.find('[name="actorType"]').val();
+            const nm = html.find('[name="name"]').val() || name;
+            const folder = await getOrCreateFolder("Actor", makeFolderPath(asset));
+            const actor = await Actor.create({
+              name: nm, type: at, folder: folder?.id || null,
+              img: asset._localPath,
+              prototypeToken: { name: nm, texture: { src: asset._localPath } },
+            });
+            const sceneGrid = canvas.grid?.size || 100;
+            let cx = dropPos?.x ?? canvas.dimensions.width / 2;
+            let cy = dropPos?.y ?? canvas.dimensions.height / 2;
+            if (game.settings.get(MODULE_ID, "snapToGrid")) {
+              cx = Math.round(cx / sceneGrid) * sceneGrid;
+              cy = Math.round(cy / sceneGrid) * sceneGrid;
+            }
+            const td = await actor.getTokenDocument({ x: cx - sceneGrid / 2, y: cy - sceneGrid / 2 });
+            await canvas.scene.createEmbeddedDocuments("Token", [td.toObject()]);
+            ui.notifications.info(`Token 已创建: ${nm}`);
+            resolve(actor);
+          }
+        },
+        cancel: { icon: '<i class="fas fa-times"></i>', label: "取消", callback: () => resolve(null) }
+      },
+      default: "create",
+    }).render(true);
+  });
+}
+
+/** Sidebar drop: 图 → Scene 侧栏 = 用此图建新 Scene */
+async function createSceneFromImage(asset) {
+  const name = asset?.name || asset?.filepath?.split("/").pop()?.replace(/\.[^.]+$/, "") || "新场景";
+  const w = (asset.size?.width || 0) > 0 ? asset.size.width : 4000;
+  const h = (asset.size?.height || 0) > 0 ? asset.size.height : 3000;
+  const folder = await getOrCreateFolder("Scene", makeFolderPath(asset));
+  const scene = await Scene.create({
+    name, folder: folder?.id || null,
+    width: w, height: h, padding: 0.25,
+    background: { src: asset._localPath },
+    grid: { size: 100 },
+  });
+  // 生成 thumb
+  try {
+    const t = await scene.createThumbnail({ img: asset._localPath });
+    if (t?.thumb) await scene.update({ thumb: t.thumb });
+  } catch {}
+  await scene.view();
+  ui.scenes?.activate();
+  ui.notifications.info(`Scene 已建: ${name}`);
+  return scene;
+}
+
+/** Sidebar drop: 音频 → Playlist 侧栏 = 加入指定 Playlist */
+async function addAudioToSpecificPlaylist(asset, playlistId) {
+  const playlist = game.playlists.get(playlistId);
+  if (!playlist) throw new Error(`找不到 playlist ${playlistId}`);
+  const channel = game.settings.get(MODULE_ID, "audioChannel");
+  const rawVolume = Number(game.settings.get(MODULE_ID, "audioVolume"));
+  const volume = (foundry.audio?.AudioHelper?.inputToVolume?.(rawVolume))
+    ?? (AudioHelper?.inputToVolume?.(rawVolume)) ?? rawVolume;
+  const name = asset?.name || asset?.filepath?.split("/").pop()?.replace(/\.[^.]+$/, "") || "Sound";
+  const [s] = await playlist.createEmbeddedDocuments("PlaylistSound", [{
+    name, path: asset._localPath, channel, volume,
+  }]);
+  ui.notifications.info(`已加入 "${playlist.name}": ${name}`);
+  return s;
+}
+
+/** Sidebar drop: Item → Actor sheet/sidebar */
+async function addItemToActor(asset, actor) {
+  const text = await fetchAndRewrite(asset._localPath, asset._packPath);
+  const data = safeJsonParse(text, asset._localPath);
+  delete data._stats;
+  delete data._id;  // 加到 actor 里不保 id
+  const [item] = await actor.createEmbeddedDocuments("Item", [data]);
+  ui.notifications.info(`Item 加给 ${actor.name}: ${item.name}`);
+  return item;
 }
 
 async function importAsset(asset, dropPos = null) {
@@ -626,8 +776,17 @@ async function importAsset(asset, dropPos = null) {
 
   if (at === 3 || at === 2) {
     if (!canvas?.scene) {
-      ui.notifications.warn("没有打开的场景,无法放置 Tile");
+      ui.notifications.warn("没有打开的场景,无法放置");
       return null;
+    }
+    const dropAs = game.settings.get(MODULE_ID, "dropImageAs");
+    if (dropAs === "note") {
+      const note = await createNoteFromImage(asset, dropPos);
+      ui.notifications.info(`Note 已创建: ${asset.name || asset.filepath}`);
+      return note;
+    }
+    if (dropAs === "token") {
+      return await createTokenFromImage(asset, dropPos);
     }
     const tile = await createTileFromAsset(asset, dropPos);
     ui.notifications.info(`${isVideoUrl(url) ? "视频 " : ""}Tile 已创建: ${url.split("/").pop()}`);
@@ -706,12 +865,21 @@ class LalBrowser extends Application {
     super(options);
     this.filterType = "3";
     this.filterCreator = "";
+    this.filterPack = "";
+    this.filterFolder = "";
     this.searchQuery = "";
     this.sortMode = "name-asc";
     this.page = 0;
     this.pageSize = 60;
     this.selectMode = false;
     this.selectedIds = new Set();
+    this.favoritesOnly = false;
+    // 客户端 favorites 从设置加载
+    this.favorites = new Set(game.settings.get(MODULE_ID, "favorites") || []);
+  }
+
+  async _saveFavorites() {
+    await game.settings.set(MODULE_ID, "favorites", [...this.favorites]);
   }
 
   get index() { return game.modules.get(MODULE_ID).api.index; }
@@ -793,8 +961,31 @@ class LalBrowser extends Application {
       query: this.searchQuery,
       types: typeFilter,
       creators: this.filterCreator ? [this.filterCreator] : null,
+      packs: this.filterPack ? [this.filterPack] : null,
+      folderPrefix: this.filterFolder || null,
+      favoritesOnly: this.favoritesOnly,
+      favorites: this.favorites,
       sort: this.sortMode,
     });
+
+    // 计算当前 creator+pack 下的 subfolders 列表 (folder navigation)
+    let subFolders = [];
+    if (this.filterCreator && this.filterPack) {
+      subFolders = this.index.getFoldersForPack(this.filterCreator, this.filterPack);
+    }
+    // pack 选项: 当前 creator 下有内容的 pack
+    let packOptions = [];
+    if (this.filterCreator) {
+      const seen = new Map();
+      for (const a of this.index.assets) {
+        if (a.pack?.creator !== this.filterCreator) continue;
+        const pn = a.pack?.name;
+        if (!pn) continue;
+        seen.set(pn, (seen.get(pn) || 0) + 1);
+      }
+      packOptions = [...seen.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([name, count]) => ({ name, count, selected: name === this.filterPack }));
+    }
     const pageStart = this.page * this.pageSize;
     const pageEnd = Math.min(pageStart + this.pageSize, results.length);
     const pageAssets = results.slice(pageStart, pageEnd);
@@ -803,10 +994,15 @@ class LalBrowser extends Application {
     return {
       total: results.length, page: this.page + 1, totalPages,
       pageStart: pageStart + 1, pageEnd,
-      searchQuery: this.searchQuery, filterType: this.filterType, filterCreator: this.filterCreator,
+      searchQuery: this.searchQuery, filterType: this.filterType,
+      filterCreator: this.filterCreator, filterPack: this.filterPack, filterFolder: this.filterFolder,
       sortMode: this.sortMode,
       selectMode: this.selectMode,
       selectedCount: this.selectedIds.size,
+      favoritesOnly: this.favoritesOnly,
+      favoritesCount: this.favorites.size,
+      packs: packOptions,
+      subFolders: subFolders.map(f => ({ name: f, selected: f === this.filterFolder })),
       tileSize: game.settings.get(MODULE_ID, "tileSize"),
       sortOptions: [
         { id: "name-asc", label: "名字 A→Z", selected: this.sortMode === "name-asc" },
@@ -843,6 +1039,7 @@ class LalBrowser extends Application {
           isImage,
           isAnimated,
           isSelected: this.selectedIds.has(idStr),
+          isFavorite: this.favorites.has(idStr),
           // grid 缩略图 URL: 优先 _thumbLocal (server-gen, 需 thumb 已下载),
           // 否则 isImage 时用原图,其他类型 fall back 到 type badge
           thumbUrl: a._thumbLocal || null,
@@ -872,7 +1069,7 @@ class LalBrowser extends Application {
       root.classList.add(`lal-size-${game.settings.get(MODULE_ID, "tileSize")}`);
     }
 
-    html.find(".lal-search, .lal-filter-type, .lal-filter-creator, .lal-filter-sort, .lal-page-prev, .lal-page-next, .lal-scan, .lal-toggle-select, .lal-bulk-import, .lal-clear-select, .lal-action-import, .lal-action-clipboard, .lal-action-preview, .lal-tile-checkbox").off();
+    html.find(".lal-search, .lal-filter-type, .lal-filter-creator, .lal-filter-pack, .lal-filter-folder, .lal-filter-sort, .lal-page-prev, .lal-page-next, .lal-scan, .lal-toggle-select, .lal-bulk-import, .lal-clear-select, .lal-action-import, .lal-action-clipboard, .lal-action-preview, .lal-action-favorite, .lal-toggle-favorites, .lal-tile-checkbox").off();
 
     html.find(".lal-search").on("input", debounce(ev => {
       this.searchQuery = ev.target.value; this.page = 0; this.render();
@@ -881,7 +1078,29 @@ class LalBrowser extends Application {
       this.filterType = ev.target.value; this.page = 0; this.render();
     }));
     html.find(".lal-filter-creator").on("change", safe(ev => {
-      this.filterCreator = ev.target.value; this.page = 0; this.render();
+      this.filterCreator = ev.target.value;
+      this.filterPack = "";   // 换 creator 清 pack/folder
+      this.filterFolder = "";
+      this.page = 0; this.render();
+    }));
+    html.find(".lal-filter-pack").on("change", safe(ev => {
+      this.filterPack = ev.target.value; this.filterFolder = "";
+      this.page = 0; this.render();
+    }));
+    html.find(".lal-filter-folder").on("change", safe(ev => {
+      this.filterFolder = ev.target.value; this.page = 0; this.render();
+    }));
+    html.find(".lal-toggle-favorites").on("click", safe(() => {
+      this.favoritesOnly = !this.favoritesOnly; this.page = 0; this.render();
+    }));
+    html.find(".lal-action-favorite").on("click", safe(async (ev) => {
+      ev.stopPropagation();
+      const tile = ev.currentTarget.closest(".lal-tile");
+      const id = String(tile?.dataset.id ?? "");
+      if (this.favorites.has(id)) this.favorites.delete(id);
+      else this.favorites.add(id);
+      await this._saveFavorites();
+      this.render();
     }));
     html.find(".lal-filter-sort").on("change", safe(ev => {
       this.sortMode = ev.target.value; this.page = 0; this.render();
@@ -1061,6 +1280,21 @@ Hooks.once("init", () => {
     hint: "MAD 等内容包带很多旧版墙线包 (有墙无图) + 占位模板. 默认跳过. 关掉的话仍可手动 import.",
     scope: "world", config: true, type: Boolean, default: true,
   });
+  game.settings.register(MODULE_ID, "dropImageAs", {
+    name: "图片拖到画布时建为",
+    hint: "Tile=贴图, Note=日志 pin, Token=演员 token (会弹选 actor 类型对话框)",
+    scope: "client", config: true, type: String, default: "tile",
+    choices: { tile: "Tile (贴图)", note: "Note (日志 pin)", token: "Token (演员)" },
+  });
+  game.settings.register(MODULE_ID, "snapToGrid", {
+    name: "拖拽放置时对齐格子",
+    hint: "Tile/Note/Token 放置时把中心点 snap 到 scene 网格",
+    scope: "client", config: true, type: Boolean, default: true,
+  });
+  game.settings.register(MODULE_ID, "favorites", {
+    name: "(internal) 收藏的 asset id 列表",
+    scope: "client", config: false, type: Array, default: [],
+  });
 
   const mod = game.modules.get(MODULE_ID);
   mod.api = {
@@ -1139,6 +1373,62 @@ Hooks.on("dropCanvasData", (canvas, data) => {
     ui.notifications.error(`导入失败: ${e.message}`);
   });
   return false;
+});
+
+// ---------- Sidebar drop hooks ----------
+
+/** Item → Actor sheet 加 inventory */
+Hooks.on("dropActorSheetData", (actor, sheet, data) => {
+  if (data?.type !== "local-asset-library") return true;
+  const idx = game.modules.get(MODULE_ID).api.index;
+  const asset = idx?.assets.find(a => String(a._id) === String(data.assetId));
+  if (!asset || (asset._type ?? asset.type) !== 6) return true;
+  addItemToActor(asset, actor).catch(e => {
+    console.error(`[${MODULE_ID}] item→actor 失败:`, e);
+    ui.notifications.error(`加 item 到 ${actor.name} 失败: ${e.message}`);
+  });
+  return false;
+});
+
+/** Audio → Playlist 侧栏 = 加入指定 playlist (拖到 playlist 条目上) */
+Hooks.on("renderPlaylistDirectory", (app, html) => {
+  const $html = html instanceof jQuery ? html : $(html);
+  // 用 namespaced off 防 listener 叠加
+  $html.off("drop.lal").on("drop.lal", ".directory-item", (ev) => {
+    const dt = ev.originalEvent?.dataTransfer;
+    if (!dt) return;
+    let data; try { data = JSON.parse(dt.getData("text/plain")); } catch { return; }
+    if (data?.type !== "local-asset-library") return;
+    const idx = game.modules.get(MODULE_ID).api.index;
+    const asset = idx?.assets.find(a => String(a._id) === String(data.assetId));
+    if (!asset || (asset._type ?? asset.type) !== 7) return;
+    const playlistId = ev.currentTarget.dataset.entryId || ev.currentTarget.dataset.documentId;
+    if (!playlistId) return;
+    ev.preventDefault(); ev.stopPropagation();
+    addAudioToSpecificPlaylist(asset, playlistId).catch(e => {
+      console.error(e); ui.notifications.error(`加入 playlist 失败: ${e.message}`);
+    });
+  });
+});
+
+/** 图/地图 → Scene 侧栏 = 用此图建新 Scene */
+Hooks.on("renderSceneDirectory", (app, html) => {
+  const $html = html instanceof jQuery ? html : $(html);
+  $html.off("drop.lal").on("drop.lal", (ev) => {
+    const dt = ev.originalEvent?.dataTransfer;
+    if (!dt) return;
+    let data; try { data = JSON.parse(dt.getData("text/plain")); } catch { return; }
+    if (data?.type !== "local-asset-library") return;
+    const idx = game.modules.get(MODULE_ID).api.index;
+    const asset = idx?.assets.find(a => String(a._id) === String(data.assetId));
+    if (!asset) return;
+    const at = asset._type ?? asset.type;
+    if (at !== 3 && at !== 2) return;
+    ev.preventDefault(); ev.stopPropagation();
+    createSceneFromImage(asset).catch(e => {
+      console.error(e); ui.notifications.error(`建 Scene 失败: ${e.message}`);
+    });
+  });
 });
 
 Hooks.once("ready", () => {
