@@ -137,6 +137,19 @@ class LalScanner {
     }
   }
 
+  /** 试读 <rootSubpath>/_lal_health.json (scene-health.py 生成的) 返回 {sid: {total, missing}} 或 null */
+  async loadHealth() {
+    const url = `${this.rootSubpath}/_lal_health.json`;
+    try {
+      const r = await fetch(url);
+      if (!r.ok) return null;
+      const d = await r.json();
+      if (d.version !== 1) return null;
+      console.log(`[${MODULE_ID}] 载入 scene 健康度报告: ${Object.keys(d.scenes || {}).length} 条`);
+      return d.scenes || {};
+    } catch { return null; }
+  }
+
   async scan(onProgress = null) {
     const allAssets = [];
     let nCreators = 0, nPacks = 0, nMetaFiles = 0;
@@ -196,6 +209,19 @@ class LalScanner {
           }
         }
       }
+    }
+
+    // 合并 health 数据到 scene 类型 asset 上
+    const health = await this.loadHealth();
+    if (health) {
+      let merged = 0;
+      for (const a of allAssets) {
+        const t = a._type ?? a.type;
+        if (t !== 1) continue;  // 只 scene
+        const h = health[String(a._id)];
+        if (h) { a._health = { total: h.total, missing: h.missing }; merged++; }
+      }
+      console.log(`[${MODULE_ID}] health 合并到 ${merged} 个 scene`);
     }
 
     onProgress?.(`完成: ${allAssets.length} 个 asset / ${nPacks} 个合集 / ${nMetaFiles} 个 metadata`);
@@ -1069,9 +1095,14 @@ class LalBrowser extends Application {
           isAnimated,
           isSelected: this.selectedIds.has(idStr),
           isFavorite: this.favorites.has(idStr),
-          // grid 缩略图 URL: 优先 _thumbLocal (server-gen, 需 thumb 已下载),
-          // 否则 isImage 时用原图,其他类型 fall back 到 type badge
           thumbUrl: a._thumbLocal || null,
+          // scene 健康度: 0 missing = 满,1-3 = 轻微,>3 = 破损
+          healthClass: a._health ? (a._health.missing === 0 ? "ok"
+                                   : a._health.missing <= 3 ? "minor" : "broken") : null,
+          healthIcon: a._health ? (a._health.missing === 0 ? "check-circle"
+                                  : a._health.missing <= 3 ? "exclamation-circle" : "times-circle") : null,
+          healthMissing: a._health?.missing ?? null,
+          healthTotal: a._health?.total ?? null,
         };
       }),
       types: [...this.index.byType.keys()].sort((a, b) => a - b).map(t => ({

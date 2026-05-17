@@ -78,6 +78,7 @@
             {{else if isImage}}<img src="{{url}}" loading="lazy" draggable="false" />
             {{else}}<span class="lal-type-badge">{{typeName}}</span>{{/if}}
             {{#if isAnimated}}<span class="lal-anim-badge" title="动图/视频"><i class="fas fa-play-circle"></i></span>{{/if}}
+            {{#if healthClass}}<span class="lal-health-badge lal-health-{{healthClass}}" title="{{#unless healthMissing}}所有 {{healthTotal}} 个 tile 都在本地{{else}}缺 {{healthMissing}}/{{healthTotal}} 个 tile{{/unless}}"><i class="fas fa-{{healthIcon}}"></i></span>{{/if}}
             {{#unless ../selectMode}}
               <div class="lal-overlay">
                 <div class="lal-menu">
