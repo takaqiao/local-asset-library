@@ -35,6 +35,13 @@
       {{/if}}
     </div>
 
+    {{#unless assets.length}}
+      <div class="lal-empty-results">
+        <p><i class="fas fa-search"></i> 没有匹配的素材</p>
+        <p style="opacity:0.6;font-size:0.85em">试试改一下搜索词或筛选条件</p>
+      </div>
+    {{/unless}}
+
     <div class="lal-grid">
       {{#each assets}}
         <div class="lal-tile {{#if isSelected}}lal-tile-selected{{/if}}"
@@ -49,7 +56,9 @@
             </label>
           {{/if}}
           <div class="lal-thumb" style="background-color: {{mainColor}};">
-            {{#if isImage}}<img src="{{url}}" loading="lazy" draggable="false" />{{else}}<span class="lal-type-badge">{{typeName}}</span>{{/if}}
+            {{#if thumbUrl}}<img src="{{thumbUrl}}" loading="lazy" draggable="false" onerror="this.style.display='none';this.nextElementSibling.style.display='inline-flex';" /><span class="lal-type-badge" style="display:none">{{typeName}}</span>
+            {{else if isImage}}<img src="{{url}}" loading="lazy" draggable="false" />
+            {{else}}<span class="lal-type-badge">{{typeName}}</span>{{/if}}
             {{#if isAnimated}}<span class="lal-anim-badge" title="动图/视频"><i class="fas fa-play-circle"></i></span>{{/if}}
             {{#unless ../selectMode}}
               <div class="lal-overlay">

@@ -176,11 +176,19 @@ class LalScanner {
             const type = meta.type;
             for (const asset of (meta.assets || [])) {
               const localFile = `${packDir}/${asset.filepath}`;
+              // 抽 thumb 路径: metadata.thumb = "json/scene/X_thumb.webp?sig=..."
+              // 去掉 SAS 查询串, 拼成本地路径; 文件可能不存在,UI 用 onerror 兜底
+              let thumbLocal = null;
+              if (asset.thumb) {
+                const pathPart = String(asset.thumb).split("?")[0];
+                if (pathPart) thumbLocal = `${packDir}/${pathPart}`;
+              }
               allAssets.push({
                 ...asset,
                 _localPath: localFile,
                 _packPath: packDir,
                 _type: type,
+                _thumbLocal: thumbLocal,
               });
             }
           } catch (e) {
@@ -562,7 +570,10 @@ async function importPDFAsJournal(url, asset) {
 
 async function addOrToggleAudio(url, asset) {
   const channel = game.settings.get(MODULE_ID, "audioChannel");
-  const volume = Number(game.settings.get(MODULE_ID, "audioVolume"));
+  const rawVolume = Number(game.settings.get(MODULE_ID, "audioVolume"));
+  // Moulinette 用 AudioHelper.inputToVolume 把 input slider 0-1 转 perceptual log scale
+  const volume = (foundry.audio?.AudioHelper?.inputToVolume?.(rawVolume))
+    ?? (AudioHelper?.inputToVolume?.(rawVolume)) ?? rawVolume;
   let playlist = game.playlists.find(p => p.name === PLAYLIST_NAME);
   if (!playlist) {
     playlist = await Playlist.create({ name: PLAYLIST_NAME, mode: -1 });
@@ -762,6 +773,8 @@ class LalBrowser extends Application {
 
   async close(options) {
     document.getElementById("lal-audio-preview")?.remove();
+    // 清掉 singleton 引用,下次 openBrowser 拿到全新实例(不带 stale filter/page/select 状态)
+    if (LalBrowser._instance === this) LalBrowser._instance = null;
     return super.close(options);
   }
 
@@ -773,9 +786,12 @@ class LalBrowser extends Application {
                sortMode: this.sortMode, selectMode: false, selectedCount: 0,
                tileSize: game.settings.get(MODULE_ID, "tileSize") };
     }
+    // filterType 空字符串 → null (不要 Number("") = 0 误当成 type 0 过滤)
+    const typeFilter = (this.filterType && this.filterType !== "")
+      ? [Number(this.filterType)] : null;
     const results = this.index.search({
       query: this.searchQuery,
-      types: this.filterType ? [Number(this.filterType)] : null,
+      types: typeFilter,
       creators: this.filterCreator ? [this.filterCreator] : null,
       sort: this.sortMode,
     });
@@ -822,6 +838,9 @@ class LalBrowser extends Application {
           isImage,
           isAnimated,
           isSelected: this.selectedIds.has(idStr),
+          // grid 缩略图 URL: 优先 _thumbLocal (server-gen, 需 thumb 已下载),
+          // 否则 isImage 时用原图,其他类型 fall back 到 type badge
+          thumbUrl: a._thumbLocal || null,
         };
       }),
       types: [...this.index.byType.keys()].sort((a, b) => a - b).map(t => ({
@@ -914,7 +933,10 @@ class LalBrowser extends Application {
       if (_autoScanInProgress) return;
       const $b = $(ev.currentTarget); $b.prop("disabled", true);
       try {
-        game.modules.get(MODULE_ID).api.index = null;  // 清掉旧 index 强制重扫
+        // 重扫时清掉旧 selection (旧 ids 对新 index 是孤儿)
+        this.selectedIds.clear();
+        this.selectMode = false;
+        game.modules.get(MODULE_ID).api.index = null;
         await this._autoScan(true);
       } catch (e) {
         console.error(e); ui.notifications.error(`扫描出错: ${e.message}`);
@@ -1091,7 +1113,8 @@ Hooks.on("renderJournalDirectory", (app, html) => {
   $html.find(".directory-header, header.directory-header").first().after(btn);
 });
 
-Hooks.on("dropCanvasData", async (canvas, data) => {
+// 钩子必须 sync 返回 false 阻止默认处理. 把 async 任务 fire-and-forget 跑.
+Hooks.on("dropCanvasData", (canvas, data) => {
   if (data?.type !== "local-asset-library") return true;
   console.log(`[${MODULE_ID}] dropCanvasData`, data);
 
@@ -1105,14 +1128,11 @@ Hooks.on("dropCanvasData", async (canvas, data) => {
     console.warn(`[${MODULE_ID}] 找不到 asset ${data.assetId}`);
     return false;
   }
-
-  try {
-    const dropPos = { x: data.x, y: data.y };
-    await importAsset(asset, dropPos);
-  } catch (e) {
+  // 异步导入, 但 hook 立即返回 false 阻止默认行为
+  importAsset(asset, { x: data.x, y: data.y }).catch(e => {
     console.error(`[${MODULE_ID}] 导入失败:`, e);
     ui.notifications.error(`导入失败: ${e.message}`);
-  }
+  });
   return false;
 });
 
