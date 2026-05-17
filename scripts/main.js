@@ -823,7 +823,12 @@ class LalBrowser extends Application {
         return {
           id: a._id,
           filepath: a.filepath,
-          baseName: a.filepath?.split("/").pop() || a.filepath,
+          // 优先 metadata name (MAD 的 scene 名字带漂亮标点),
+          // 其次文件名 (无 ext), 都没就用 filepath
+          baseName: a.name
+            || a.filepath?.split("/").pop()?.replace(/\.[^.]+$/, "")
+            || a.filepath
+            || "(未命名)",
           pack: a.pack?.name || "",
           creator: a.pack?.creator || "",
           typeId: tid,
