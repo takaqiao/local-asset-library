@@ -343,6 +343,28 @@ async function importReferencedDocs(refIds, packPath, docName) {
 }
 
 // scene 分类: "empty" 全空 / "walls-only" 只有墙线无图 / "overlay" 透明图层 / "normal" 正常
+const OVERLAY_FILENAME_RE = /transparent|canopy|_roof|_topfr|_top_fr|foreground|_overlay/i;
+
+/**
+ * 挑最合适的图当 thumb 源.
+ * 优先 background.src; 否则按面积降序找第一个非 overlay 的 tile;
+ * 都没有就用最大 tile (好歹有轮廓).
+ */
+function pickThumbnailSource(scene) {
+  const bgSrc = scene.background?.src;
+  if (bgSrc) return bgSrc;
+  const tiles = scene.tiles?.contents || [];
+  if (tiles.length === 0) return null;
+  const sorted = [...tiles].sort((a, b) =>
+    ((b.width || 0) * (b.height || 0)) - ((a.width || 0) * (a.height || 0))
+  );
+  const opaque = sorted.find(t => {
+    const fname = (t.texture?.src || "").split("/").pop() || "";
+    return !OVERLAY_FILENAME_RE.test(fname);
+  });
+  return opaque?.texture?.src || sorted[0]?.texture?.src || null;
+}
+
 function classifyScene(parsed) {
   const tiles = parsed.tiles || [];
   const walls = parsed.walls || [];
