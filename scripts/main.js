@@ -461,17 +461,17 @@ async function importSceneJSON(text, asset) {
   }
 
   if (game.settings.get(MODULE_ID, "genThumbnails")) {
-    const bgSrc = scene.background?.src
-      || (scene.tiles?.contents || [])
-        .sort((a, b) => (b.width * b.height) - (a.width * a.height))[0]?.texture?.src;
-    if (bgSrc) {
+    const thumbSrc = pickThumbnailSource(scene);
+    if (thumbSrc) {
       try {
-        const t = await scene.createThumbnail({ img: bgSrc });
+        const t = await scene.createThumbnail({ img: thumbSrc });
         if (t?.thumb) await scene.update({ thumb: t.thumb });
-        console.log(`[${MODULE_ID}] 缩略图已生成`);
+        console.log(`[${MODULE_ID}] 缩略图生成自: ${thumbSrc.split("/").pop()}`);
       } catch (e) {
         console.warn(`[${MODULE_ID}] 生成缩略图失败:`, e);
       }
+    } else {
+      console.log(`[${MODULE_ID}] 无可用源图, 跳过 thumb`);
     }
   }
 
