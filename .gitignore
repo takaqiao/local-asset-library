@@ -6,3 +6,6 @@ Thumbs.db
 node_modules/
 module.zip
 *.swp
+
+# releases/ 下的版本快照 zip 是故意要进 git 的(线下分发补丁用)
+!releases/**/module.zip
