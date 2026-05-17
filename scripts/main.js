@@ -262,48 +262,84 @@ async function fetchAndRewrite(url, packPath) {
   return text;
 }
 
-async function importPackCompanions(packPath) {
-  const idx = game.modules.get(MODULE_ID).api.index;
-  if (!idx || !packPath) return { imported: 0, skipped: 0 };
-  const companions = idx.assets.filter(a => {
-    if (a._packPath !== packPath) return false;
-    const t = a._type ?? a.type;
-    return t === 8 || t === 9;
-  });
-  if (companions.length === 0) return { imported: 0, skipped: 0 };
+/**
+ * 从 scene JSON 抽取所有 world-level 文档引用 ID
+ * 不抓 Compendium.* 引用 (我们没那个 compendium)
+ */
+function extractSceneRefs(text, parsed) {
+  const journalIds = new Set();
+  const playlistIds = new Set();
+  const actorIds = new Set();
 
-  let imported = 0, skipped = 0;
-  console.log(`[${MODULE_ID}] 同包伴随导入: 检查 ${companions.length} 个...`);
-  for (const ca of companions) {
-    const tid = ca._type ?? ca.type;
-    const docName = DOC_CLASS_BY_TYPE[tid];
-    const cls = CONFIG[docName]?.documentClass;
-    if (!cls) continue;
+  // UUID 形态: "JournalEntry.AbCdEf1234567890" - tile flags / region behaviors 里常用
+  for (const m of text.matchAll(/["']JournalEntry\.([A-Za-z0-9]{8,32})["']/g)) journalIds.add(m[1]);
+  for (const m of text.matchAll(/["']Playlist\.([A-Za-z0-9]{8,32})["']/g)) playlistIds.add(m[1]);
+  for (const m of text.matchAll(/["']Actor\.([A-Za-z0-9]{8,32})["']/g)) actorIds.add(m[1]);
+
+  // 字段形态: scene.notes[].entryId, scene.tokens[].actor, scene.playlist
+  for (const note of (parsed.notes || [])) {
+    if (note.entryId) journalIds.add(note.entryId);
+  }
+  for (const tok of (parsed.tokens || [])) {
+    if (tok.actor) actorIds.add(tok.actor);
+    if (tok.actorId) actorIds.add(tok.actorId);
+  }
+  if (parsed.playlist) playlistIds.add(parsed.playlist);
+
+  return { journalIds, playlistIds, actorIds };
+}
+
+/**
+ * 找同 pack 里 _id 匹配的资产并 import (按 keepId 保留 id, 这样 scene 内引用得以解析)
+ * 比"import 整 pack"省事多了 - 之前 13 个 journal 中只有 1 个被引用,现在只 import 那 1 个
+ */
+async function importReferencedDocs(refIds, packPath, docName) {
+  const idx = game.modules.get(MODULE_ID).api.index;
+  if (!idx || refIds.size === 0) return 0;
+  const typeId = { JournalEntry: 8, Playlist: 9, Actor: 5, Item: 6, Macro: 10, RollTable: 11 }[docName];
+  if (!typeId) return 0;
+  const cls = CONFIG[docName]?.documentClass;
+  if (!cls) return 0;
+  const collectionKey = docName.charAt(0).toLowerCase() + docName.slice(1) + "s";
+
+  const candidates = idx.assets.filter(a =>
+    a._packPath === packPath && (a._type ?? a.type) === typeId
+  );
+  if (candidates.length === 0) return 0;
+
+  let imported = 0;
+  const remaining = new Set(refIds);
+  for (const ca of candidates) {
+    if (remaining.size === 0) break;
     try {
       const text = await fetchAndRewrite(ca._localPath, ca._packPath);
       const data = safeJsonParse(text, ca._localPath);
+      if (!remaining.has(data._id)) continue;
+      remaining.delete(data._id);
+
+      if (game[collectionKey]?.get?.(data._id)) continue;  // 已在 world
+
       delete data._stats;
-      const collectionKey = `${docName.charAt(0).toLowerCase() + docName.slice(1)}s`;
-      const existing = data._id && game[collectionKey]?.get?.(data._id);
-      if (existing) { skipped++; continue; }
       const folder = await getOrCreateFolder(docName, makeFolderPath(ca));
       if (folder) data.folder = folder.id;
       const docData = await cls.fromImport(data);
       try {
         await cls.create(docData, { keepId: true });
-        imported++;
       } catch {
         const plain = (typeof docData.toObject === "function") ? docData.toObject() : { ...docData };
         delete plain._id;
         await cls.create(plain);
-        imported++;
       }
+      imported++;
+      console.log(`[${MODULE_ID}]   ↳ import 引用 ${docName} ${data._id} (${ca.filepath?.split("/").pop()})`);
     } catch (e) {
-      console.warn(`[${MODULE_ID}] 同包伴随导入失败 ${ca._localPath}:`, e.message);
+      console.warn(`[${MODULE_ID}] 解析 ${ca._localPath} 失败:`, e.message);
     }
   }
-  console.log(`[${MODULE_ID}] 同包伴随导入: 新增=${imported} 跳过=${skipped}`);
-  return { imported, skipped };
+  if (remaining.size > 0) {
+    console.warn(`[${MODULE_ID}] ${remaining.size} 个 ${docName} 引用在本 pack 未找到:`, [...remaining]);
+  }
+  return imported;
 }
 
 async function importSceneJSON(text, asset) {
@@ -315,7 +351,22 @@ async function importSceneJSON(text, asset) {
     delete parsed.thumb;
   }
 
-  if (asset?._packPath) await importPackCompanions(asset._packPath);
+  // 只 import scene 真正引用的 journal/playlist/actor, 不创空 stub
+  if (asset?._packPath) {
+    const refs = extractSceneRefs(text, parsed);
+    if (refs.journalIds.size > 0) {
+      const n = await importReferencedDocs(refs.journalIds, asset._packPath, "JournalEntry");
+      console.log(`[${MODULE_ID}] 按引用 import ${n}/${refs.journalIds.size} 个 journal`);
+    }
+    if (refs.playlistIds.size > 0) {
+      const n = await importReferencedDocs(refs.playlistIds, asset._packPath, "Playlist");
+      console.log(`[${MODULE_ID}] 按引用 import ${n}/${refs.playlistIds.size} 个 playlist`);
+    }
+    if (refs.actorIds.size > 0) {
+      const n = await importReferencedDocs(refs.actorIds, asset._packPath, "Actor");
+      console.log(`[${MODULE_ID}] 按引用 import ${n}/${refs.actorIds.size} 个 actor`);
+    }
+  }
 
   const folder = await getOrCreateFolder("Scene", makeFolderPath(asset));
   if (folder) parsed.folder = folder.id;
