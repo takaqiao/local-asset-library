@@ -13,33 +13,58 @@
   height: 100%; gap: 12px;
 }
 
+/* ---------- header ---------- */
 .lal-root .lal-header {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 180px 220px 36px;
-  gap: 8px; padding: 8px;
+  grid-template-columns: minmax(0, 1fr) 160px 200px 140px 36px 36px;
+  gap: 6px; padding: 8px;
   border-bottom: 1px solid var(--color-border-light-secondary, #444);
   flex-shrink: 0; align-items: center;
 }
 .lal-root .lal-search,
 .lal-root .lal-filter-type,
-.lal-root .lal-filter-creator {
+.lal-root .lal-filter-creator,
+.lal-root .lal-filter-sort {
   width: 100% !important; height: 30px; margin: 0;
   padding: 4px 8px; font-size: 13px; line-height: 1.2;
 }
-.lal-root .lal-scan {
+.lal-root .lal-scan,
+.lal-root .lal-toggle-select {
   width: 36px !important; height: 30px; padding: 0; margin: 0;
   font-size: 13px; display: inline-flex; align-items: center; justify-content: center;
 }
-
-.lal-root .lal-stats {
-  padding: 4px 10px; font-size: 0.85em; opacity: 0.7; flex-shrink: 0;
+.lal-root .lal-toggle-select[data-active="1"] {
+  background: #ff6; color: #000;
 }
 
+/* ---------- stats / select bar ---------- */
+.lal-root .lal-stats {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 4px 10px; font-size: 0.85em; opacity: 0.85; flex-shrink: 0;
+  gap: 12px; flex-wrap: wrap;
+}
+.lal-root .lal-select-bar { display: flex; align-items: center; gap: 6px; }
+.lal-root .lal-select-bar button {
+  width: auto !important; height: 26px; padding: 2px 10px !important;
+  margin: 0; font-size: 0.9em;
+}
+.lal-root .lal-selected-count { color: #ff6; font-weight: bold; }
+
+/* ---------- grid (尺寸由 .lal-size-* 控制) ---------- */
 .lal-root .lal-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
   gap: 8px; padding: 8px; overflow-y: auto;
   flex: 1; align-content: start;
+}
+.lal-root.lal-size-small .lal-grid {
+  grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+}
+.lal-root.lal-size-medium .lal-grid,
+.lal-root .lal-grid {
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+}
+.lal-root.lal-size-large .lal-grid {
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
 }
 
 .lal-root .lal-tile {
@@ -52,6 +77,18 @@
 }
 .lal-root .lal-tile:hover { border-color: #ff6; transform: translateY(-1px); }
 .lal-root .lal-tile:active { cursor: grabbing; }
+.lal-root .lal-tile-selected {
+  border-color: #ff6 !important;
+  box-shadow: 0 0 0 2px #ff6;
+}
+
+.lal-root .lal-tile-check-wrap {
+  position: absolute; top: 4px; left: 4px;
+  z-index: 10; cursor: pointer;
+  background: rgba(0, 0, 0, 0.7); padding: 2px 4px;
+  border-radius: 3px;
+}
+.lal-root .lal-tile-check-wrap input { margin: 0; cursor: pointer; }
 
 .lal-root .lal-thumb {
   aspect-ratio: 1 / 1;
@@ -68,7 +105,7 @@
   position: absolute; top: 4px; right: 4px;
   background: rgba(0,0,0,0.6); color: #ff6;
   border-radius: 50%; padding: 2px 4px; font-size: 0.9em;
-  pointer-events: none;
+  pointer-events: none; z-index: 5;
 }
 
 .lal-root .lal-overlay {
@@ -76,7 +113,7 @@
   background: rgba(0, 0, 0, 0.7);
   opacity: 0; transition: opacity 100ms;
   display: flex; align-items: center; justify-content: center;
-  pointer-events: none;
+  pointer-events: none; z-index: 8;
 }
 .lal-root .lal-thumb:hover .lal-overlay { opacity: 1; }
 .lal-root .lal-overlay .lal-menu {
@@ -111,6 +148,7 @@
   padding: 0 2px;
 }
 
+/* ---------- footer ---------- */
 .lal-root .lal-footer {
   display: flex; gap: 12px; padding: 8px;
   justify-content: center; align-items: center;

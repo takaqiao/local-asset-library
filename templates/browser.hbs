@@ -2,7 +2,7 @@
   {{#if isScanning}}
     <div class="lal-empty">
       <p><i class="fas fa-spinner fa-spin"></i> 正在扫描素材库...</p>
-      <p style="opacity:0.6;font-size:0.85em">3 万多个 asset 约需 30 秒,按 F12 看进度</p>
+      <p style="opacity:0.6;font-size:0.85em">首次扫描约 30 秒,之后从缓存秒载</p>
     </div>
   {{else}}
     <header class="lal-header">
@@ -15,27 +15,51 @@
         <option value="">全部创作者</option>
         {{#each creators}}<option value="{{name}}" {{#if selected}}selected{{/if}}>{{name}} ({{count}})</option>{{/each}}
       </select>
-      <button type="button" class="lal-scan" title="重新扫描"><i class="fas fa-sync"></i></button>
+      <select class="lal-filter-sort" title="排序">
+        {{#each sortOptions}}<option value="{{id}}" {{#if selected}}selected{{/if}}>{{label}}</option>{{/each}}
+      </select>
+      <button type="button" class="lal-toggle-select" title="切换多选" {{#if selectMode}}data-active="1"{{/if}}>
+        <i class="fas fa-check-square"></i>
+      </button>
+      <button type="button" class="lal-scan" title="重新扫描(无视缓存)"><i class="fas fa-sync"></i></button>
     </header>
 
-    <div class="lal-stats">{{total}} 个匹配 · 显示 {{pageStart}}-{{pageEnd}} (第 {{page}}/{{totalPages}} 页)</div>
+    <div class="lal-stats">
+      <span>{{total}} 个匹配 · 显示 {{pageStart}}-{{pageEnd}}</span>
+      {{#if selectMode}}
+        <span class="lal-select-bar">
+          已选 <span class="lal-selected-count">{{selectedCount}}</span> ·
+          <button type="button" class="lal-bulk-import"><i class="fas fa-file-import"></i> 批量导入选中</button>
+          <button type="button" class="lal-clear-select">清空</button>
+        </span>
+      {{/if}}
+    </div>
 
     <div class="lal-grid">
       {{#each assets}}
-        <div class="lal-tile" draggable="true" data-url="{{url}}" data-id="{{id}}"
+        <div class="lal-tile {{#if isSelected}}lal-tile-selected{{/if}}"
+             draggable="{{#unless ../selectMode}}true{{else}}false{{/unless}}"
+             data-url="{{url}}" data-id="{{id}}"
              data-type="{{typeId}}" data-w="{{imgW}}" data-h="{{imgH}}"
              data-pack-path="{{packPath}}" data-name="{{baseName}}"
              title="{{filepath}}&#10;{{pack}} · {{creator}}&#10;{{sizeText}} · {{filesizeKb}}KB">
+          {{#if ../selectMode}}
+            <label class="lal-tile-check-wrap">
+              <input type="checkbox" class="lal-tile-checkbox" data-id="{{id}}" {{#if isSelected}}checked{{/if}} />
+            </label>
+          {{/if}}
           <div class="lal-thumb" style="background-color: {{mainColor}};">
             {{#if isImage}}<img src="{{url}}" loading="lazy" draggable="false" />{{else}}<span class="lal-type-badge">{{typeName}}</span>{{/if}}
             {{#if isAnimated}}<span class="lal-anim-badge" title="动图/视频"><i class="fas fa-play-circle"></i></span>{{/if}}
-            <div class="lal-overlay">
-              <div class="lal-menu">
-                <button type="button" class="lal-action-import" title="导入到 Foundry"><i class="fas fa-file-import"></i></button>
-                <button type="button" class="lal-action-preview" title="预览"><i class="fas fa-eye"></i></button>
-                <button type="button" class="lal-action-clipboard" title="复制本地路径"><i class="fas fa-copy"></i></button>
+            {{#unless ../selectMode}}
+              <div class="lal-overlay">
+                <div class="lal-menu">
+                  <button type="button" class="lal-action-import" title="导入到 Foundry"><i class="fas fa-file-import"></i></button>
+                  <button type="button" class="lal-action-preview" title="预览"><i class="fas fa-eye"></i></button>
+                  <button type="button" class="lal-action-clipboard" title="复制本地路径"><i class="fas fa-copy"></i></button>
+                </div>
               </div>
-            </div>
+            {{/unless}}
           </div>
           <div class="lal-name">{{baseName}}</div>
           <div class="lal-meta">{{pack}}</div>

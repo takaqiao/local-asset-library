@@ -92,10 +92,49 @@ function makeFolderPath(asset) {
   return [FOLDER_ROOT, creator, pack];
 }
 
+const INDEX_CACHE_FILE = "_lal_index.json";
+const INDEX_VERSION = 1;
+
 // ---------- Scanner ----------
 class LalScanner {
   constructor(rootSubpath) {
     this.rootSubpath = rootSubpath || "assets";
+  }
+
+  /** 试读 <rootSubpath>/_lal_index.json, 命中且版本/路径匹配则返回 assets 数组 */
+  async loadCached() {
+    const url = `${this.rootSubpath}/${INDEX_CACHE_FILE}`;
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) return null;
+      const data = await resp.json();
+      if (data.version !== INDEX_VERSION) return null;
+      if (data.rootSubpath !== this.rootSubpath) return null;
+      if (!Array.isArray(data.assets)) return null;
+      console.log(`[${MODULE_ID}] 从缓存载入 ${data.assets.length} 个 asset (${data.timestamp})`);
+      return data.assets;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** 把 assets 写到 <rootSubpath>/_lal_index.json (next open 秒载) */
+  async saveCached(assets) {
+    try {
+      const data = {
+        version: INDEX_VERSION,
+        timestamp: new Date().toISOString(),
+        rootSubpath: this.rootSubpath,
+        count: assets.length,
+        assets,
+      };
+      const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+      const file = new File([blob], INDEX_CACHE_FILE, { type: "application/json" });
+      await FilePicker.upload("data", this.rootSubpath, file, {}, { notify: false });
+      console.log(`[${MODULE_ID}] 索引已缓存到 ${this.rootSubpath}/${INDEX_CACHE_FILE} (${assets.length} 个 asset)`);
+    } catch (e) {
+      console.warn(`[${MODULE_ID}] 缓存索引失败 (无写权限?):`, e);
+    }
   }
 
   async scan(onProgress = null) {
@@ -126,7 +165,7 @@ class LalScanner {
         catch (e) { console.warn(`[${MODULE_ID}] 跳过 ${packDir}:`, e); continue; }
 
         const metaFiles = packBrowse.files.filter(
-          f => f.includes("_pack_meta_") && f.endsWith(".json")
+          f => f.includes("_pack_meta_") && f.endsWith(".json") && !f.includes(INDEX_CACHE_FILE)
         );
 
         for (const metaFile of metaFiles) {
@@ -176,7 +215,7 @@ class LalIndex {
     }
   }
 
-  search({ query = "", types = null, creators = null }) {
+  search({ query = "", types = null, creators = null, sort = "name-asc" }) {
     let r = this.assets;
     if (types?.length) r = r.filter(a => types.includes(a._type ?? a.type));
     if (creators?.length) r = r.filter(a => creators.includes(a.pack?.creator));
@@ -187,7 +226,28 @@ class LalIndex {
         a.pack?.name?.toLowerCase().includes(q)
       );
     }
-    return r;
+    return LalIndex.applySort(r, sort);
+  }
+
+  static applySort(arr, mode) {
+    const sorted = [...arr];
+    switch (mode) {
+      case "name-asc":
+        sorted.sort((a, b) => (a.filepath || "").localeCompare(b.filepath || "")); break;
+      case "name-desc":
+        sorted.sort((a, b) => (b.filepath || "").localeCompare(a.filepath || "")); break;
+      case "size-desc":
+        sorted.sort((a, b) => (b.filesize || 0) - (a.filesize || 0)); break;
+      case "size-asc":
+        sorted.sort((a, b) => (a.filesize || 0) - (b.filesize || 0)); break;
+      case "pack":
+        sorted.sort((a, b) => {
+          const p = (a.pack?.name || "").localeCompare(b.pack?.name || "");
+          if (p) return p;
+          return (a.filepath || "").localeCompare(b.filepath || "");
+        }); break;
+    }
+    return sorted;
   }
 }
 
@@ -508,24 +568,42 @@ class LalBrowser extends Application {
     this.filterType = "3";
     this.filterCreator = "";
     this.searchQuery = "";
+    this.sortMode = "name-asc";
     this.page = 0;
     this.pageSize = 60;
+    this.selectMode = false;
+    this.selectedIds = new Set();
   }
 
   get index() { return game.modules.get(MODULE_ID).api.index; }
 
-  async _autoScan() {
+  async _autoScan(forceFresh = false) {
     if (_autoScanInProgress) return;
-    if (this.index) return;
+    if (this.index && !forceFresh) return;
     _autoScanInProgress = true;
     try {
       const subpath = game.settings.get(MODULE_ID, "rootSubpath");
-      ui.notifications.info(`正在扫描 ${subpath}/ ... (按 F12 看进度)`);
       const scanner = new LalScanner(subpath);
+
+      // 1) 优先吃缓存 (非强刷)
+      if (!forceFresh) {
+        const cached = await scanner.loadCached();
+        if (cached) {
+          const idx = new LalIndex(cached);
+          game.modules.get(MODULE_ID).api.index = idx;
+          ui.notifications.info(`已从缓存载入 ${cached.length} 个 asset (强刷可点右上角 ⟳)`);
+          return;
+        }
+      }
+
+      // 2) 缓存不命中或强刷 → 全扫
+      ui.notifications.info(`正在扫描 ${subpath}/ ... (按 F12 看进度)`);
       const assets = await scanner.scan(m => console.log(`[${MODULE_ID}] ${m}`));
       const idx = new LalIndex(assets);
       game.modules.get(MODULE_ID).api.index = idx;
       ui.notifications.info(`已索引 ${assets.length} 个 asset / ${idx.byCreator.size} 个创作者 / ${idx.byType.size} 种类型`);
+      // 3) 落盘缓存
+      await scanner.saveCached(assets);
     } catch (e) {
       console.error(`[${MODULE_ID}] 扫描失败:`, e);
       ui.notifications.error(`扫描失败: ${e.message}`);
@@ -563,12 +641,15 @@ class LalBrowser extends Application {
     if (!this.index) {
       if (!_autoScanInProgress) this._autoScan();
       return { isScanning: true, assets: [], types: [], creators: [],
-               total: 0, page: 0, pageStart: 0, pageEnd: 0, totalPages: 1 };
+               total: 0, page: 0, pageStart: 0, pageEnd: 0, totalPages: 1,
+               sortMode: this.sortMode, selectMode: false, selectedCount: 0,
+               tileSize: game.settings.get(MODULE_ID, "tileSize") };
     }
     const results = this.index.search({
       query: this.searchQuery,
       types: this.filterType ? [Number(this.filterType)] : null,
       creators: this.filterCreator ? [this.filterCreator] : null,
+      sort: this.sortMode,
     });
     const pageStart = this.page * this.pageSize;
     const pageEnd = Math.min(pageStart + this.pageSize, results.length);
@@ -579,10 +660,22 @@ class LalBrowser extends Application {
       total: results.length, page: this.page + 1, totalPages,
       pageStart: pageStart + 1, pageEnd,
       searchQuery: this.searchQuery, filterType: this.filterType, filterCreator: this.filterCreator,
+      sortMode: this.sortMode,
+      selectMode: this.selectMode,
+      selectedCount: this.selectedIds.size,
+      tileSize: game.settings.get(MODULE_ID, "tileSize"),
+      sortOptions: [
+        { id: "name-asc", label: "名字 A→Z", selected: this.sortMode === "name-asc" },
+        { id: "name-desc", label: "名字 Z→A", selected: this.sortMode === "name-desc" },
+        { id: "size-desc", label: "大小 大→小", selected: this.sortMode === "size-desc" },
+        { id: "size-asc", label: "大小 小→大", selected: this.sortMode === "size-asc" },
+        { id: "pack", label: "按合集", selected: this.sortMode === "pack" },
+      ],
       assets: pageAssets.map(a => {
         const tid = a._type ?? a.type;
         const isImage = tid === 3 || tid === 2;
         const isAnimated = isVideoUrl(a._localPath || "");
+        const idStr = String(a._id);
         return {
           id: a._id,
           filepath: a.filepath,
@@ -600,6 +693,7 @@ class LalBrowser extends Application {
           imgH: a.size?.height || 0,
           isImage,
           isAnimated,
+          isSelected: this.selectedIds.has(idStr),
         };
       }),
       types: [...this.index.byType.keys()].sort((a, b) => a - b).map(t => ({
@@ -619,7 +713,14 @@ class LalBrowser extends Application {
     super.activateListeners(html);
     const safe = (fn) => (...a) => { try { fn(...a); } catch (e) { console.error(`[${MODULE_ID}] listener error:`, e); } };
 
-    html.find(".lal-search, .lal-filter-type, .lal-filter-creator, .lal-page-prev, .lal-page-next, .lal-scan, .lal-action-import, .lal-action-clipboard, .lal-action-preview").off();
+    // 给根 element 加 size class 控制卡片尺寸
+    const root = this.element?.[0];
+    if (root) {
+      root.classList.remove("lal-size-small", "lal-size-medium", "lal-size-large");
+      root.classList.add(`lal-size-${game.settings.get(MODULE_ID, "tileSize")}`);
+    }
+
+    html.find(".lal-search, .lal-filter-type, .lal-filter-creator, .lal-filter-sort, .lal-page-prev, .lal-page-next, .lal-scan, .lal-toggle-select, .lal-bulk-import, .lal-clear-select, .lal-action-import, .lal-action-clipboard, .lal-action-preview, .lal-tile-checkbox").off();
 
     html.find(".lal-search").on("input", debounce(ev => {
       this.searchQuery = ev.target.value; this.page = 0; this.render();
@@ -630,24 +731,66 @@ class LalBrowser extends Application {
     html.find(".lal-filter-creator").on("change", safe(ev => {
       this.filterCreator = ev.target.value; this.page = 0; this.render();
     }));
+    html.find(".lal-filter-sort").on("change", safe(ev => {
+      this.sortMode = ev.target.value; this.page = 0; this.render();
+    }));
     html.find(".lal-page-prev").on("click", safe(() => { if (this.page > 0) { this.page--; this.render(); } }));
     html.find(".lal-page-next").on("click", safe(() => { this.page++; this.render(); }));
+
+    // 多选切换
+    html.find(".lal-toggle-select").on("click", safe(() => {
+      this.selectMode = !this.selectMode;
+      if (!this.selectMode) this.selectedIds.clear();
+      this.render();
+    }));
+    html.find(".lal-clear-select").on("click", safe(() => {
+      this.selectedIds.clear();
+      this.render();
+    }));
+    html.find(".lal-tile-checkbox").on("change", safe(ev => {
+      const id = String(ev.target.dataset.id ?? "");
+      if (ev.target.checked) this.selectedIds.add(id);
+      else this.selectedIds.delete(id);
+      // 局部更新 selected count, 不全 render (避免失焦)
+      const cnt = this.selectedIds.size;
+      this.element?.find(".lal-selected-count")?.text(cnt);
+    }));
+    html.find(".lal-bulk-import").on("click", async (ev) => {
+      if (this.selectedIds.size === 0) {
+        ui.notifications.warn("还没勾选任何素材");
+        return;
+      }
+      const $b = $(ev.currentTarget); $b.prop("disabled", true);
+      const ids = [...this.selectedIds];
+      ui.notifications.info(`开始批量导入 ${ids.length} 个素材...`);
+      let ok = 0, fail = 0;
+      for (const id of ids) {
+        const asset = this.index.assets.find(a => String(a._id) === id);
+        if (!asset) { fail++; continue; }
+        try {
+          await importAsset(asset, null);
+          ok++;
+        } catch (e) {
+          console.error(`[${MODULE_ID}] 批量导入失败 ${id}:`, e);
+          fail++;
+        }
+      }
+      ui.notifications.info(`批量完成: 成功 ${ok} / 失败 ${fail}`);
+      this.selectedIds.clear();
+      this.selectMode = false;
+      $b.prop("disabled", false);
+      this.render();
+    });
 
     html.find(".lal-scan").on("click", async (ev) => {
       if (_autoScanInProgress) return;
       const $b = $(ev.currentTarget); $b.prop("disabled", true);
       try {
-        const subpath = game.settings.get(MODULE_ID, "rootSubpath");
-        ui.notifications.info(`重新扫描 ${subpath}/...`);
-        const scanner = new LalScanner(subpath);
-        const assets = await scanner.scan(m => console.log(`[${MODULE_ID}] ${m}`));
-        const idx = new LalIndex(assets);
-        game.modules.get(MODULE_ID).api.index = idx;
-        ui.notifications.info(`已重建索引: ${assets.length} 个 asset`);
-        this.render();
+        game.modules.get(MODULE_ID).api.index = null;  // 清掉旧 index 强制重扫
+        await this._autoScan(true);
       } catch (e) {
         console.error(e); ui.notifications.error(`扫描出错: ${e.message}`);
-      } finally { $b.prop("disabled", false); }
+      } finally { $b.prop("disabled", false); this.render(); }
     });
 
     html.find(".lal-action-import").on("click", safe(async (ev) => {
@@ -746,6 +889,18 @@ Hooks.once("init", () => {
     name: "导入音频默认音量",
     scope: "world", config: true, type: Number, default: 0.8, range: { min: 0, max: 1, step: 0.05 },
   });
+  game.settings.register(MODULE_ID, "tileSize", {
+    name: "卡片尺寸",
+    hint: "浏览器里每张资产卡的大小",
+    scope: "client", config: true, type: String, default: "medium",
+    choices: { small: "小 (100px)", medium: "中 (150px)", large: "大 (220px)" },
+    onChange: () => LalBrowser._instance?.render?.(false),
+  });
+  game.settings.register(MODULE_ID, "enablePlayers", {
+    name: "允许玩家浏览",
+    hint: "开启后非 GM 也能打开浏览器查看素材 (但仍只有 GM 能导入)",
+    scope: "world", config: true, type: Boolean, default: false,
+  });
 
   const mod = game.modules.get(MODULE_ID);
   mod.api = {
@@ -767,7 +922,13 @@ Hooks.once("init", () => {
   };
 });
 
+function _userCanBrowse() {
+  if (game.user?.isGM) return true;
+  return !!game.settings.get(MODULE_ID, "enablePlayers");
+}
+
 Hooks.on("getSceneControlButtons", (controls) => {
+  if (!_userCanBrowse()) return;
   const tilesControl = Array.isArray(controls)
     ? controls.find(c => c.name === "tiles")
     : (controls.tiles || controls.tile);
@@ -787,6 +948,7 @@ Hooks.on("getSceneControlButtons", (controls) => {
 });
 
 Hooks.on("renderJournalDirectory", (app, html) => {
+  if (!_userCanBrowse()) return;
   const $html = html instanceof jQuery ? html : $(html);
   if ($html.find(".lal-sidebar-btn").length > 0) return;
   const btn = $(`<button type="button" class="lal-sidebar-btn" style="margin:4px 0;">
