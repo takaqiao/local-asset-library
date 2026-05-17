@@ -342,17 +342,38 @@ async function importReferencedDocs(refIds, packPath, docName) {
   return imported;
 }
 
-function isBlankSceneTemplate(parsed) {
-  const tiles = (parsed.tiles || []).length;
-  const walls = (parsed.walls || []).length;
-  const lights = (parsed.lights || []).length;
-  const tokens = (parsed.tokens || []).length;
-  const notes = (parsed.notes || []).length;
-  const drawings = (parsed.drawings || []).length;
-  const bg = parsed.background?.src;
-  // 完全空: 0 of everything, no bg, often no dims
-  return tiles === 0 && walls === 0 && lights === 0 && tokens === 0 &&
-         notes === 0 && drawings === 0 && !bg;
+// scene 分类: "empty" 全空 / "walls-only" 只有墙线无图 / "overlay" 透明图层 / "normal" 正常
+function classifyScene(parsed) {
+  const tiles = parsed.tiles || [];
+  const walls = parsed.walls || [];
+  const lights = parsed.lights || [];
+  const tokens = parsed.tokens || [];
+  const notes = parsed.notes || [];
+  const drawings = parsed.drawings || [];
+  const bgSrc = parsed.background?.src;
+
+  // 全空: 0 of everything, no bg
+  if (!tiles.length && !walls.length && !lights.length && !tokens.length &&
+      !notes.length && !drawings.length && !bgSrc) {
+    return "empty";
+  }
+
+  // 只有墙/灯, 无 tile 无 bg (MAD 早期 v2.3/v11 时代"墙线包")
+  if (!tiles.length && !bgSrc) {
+    return "walls-only";
+  }
+
+  // 有 tile 但都是 transparent/canopy/roof/overlay 后缀 (要叠图层用)
+  if (tiles.length && !bgSrc) {
+    const largest = tiles.reduce((m, t) =>
+      (t.width || 0) * (t.height || 0) > (m.width || 0) * (m.height || 0) ? t : m, tiles[0]);
+    const srcName = ((largest.texture?.src) || "").split("/").pop().toLowerCase();
+    if (/transparent|canopy|_roof|_topfr|_top_fr|foreground|_overlay/i.test(srcName)) {
+      return "overlay";
+    }
+  }
+
+  return "normal";
 }
 
 async function importSceneJSON(text, asset) {
@@ -364,13 +385,25 @@ async function importSceneJSON(text, asset) {
     delete parsed.thumb;
   }
 
-  // MAD 等大量内容包带很多空模板 scene (例如 mad-xxx-12.0.1 系列),
-  // 这些 0 tile/wall/light/bg 的 scene import 进去就是个空壳, 直接拒绝
-  if (isBlankSceneTemplate(parsed)) {
-    const sceneName = parsed.name || asset?.filepath || "未知";
-    console.warn(`[${MODULE_ID}] 跳过空 scene 模板: ${sceneName}`);
-    ui.notifications.warn(`"${sceneName}" 是空模板 (无 tiles/walls/bg), 已跳过`);
+  // 分类: empty/walls-only/overlay/normal
+  const kind = classifyScene(parsed);
+  const sceneName = parsed.name || asset?.filepath || "未知";
+  const skipBlank = game.settings.get(MODULE_ID, "skipBlankScenes");
+
+  if (kind === "empty") {
+    console.warn(`[${MODULE_ID}] 空模板,跳过: ${sceneName}`);
+    ui.notifications.warn(`"${sceneName}" 是空模板,已跳过`);
     return null;
+  }
+  if (kind === "walls-only" && skipBlank) {
+    console.warn(`[${MODULE_ID}] walls-only scene,跳过: ${sceneName}`);
+    ui.notifications.warn(`"${sceneName}" 只有墙/灯无背景图 (MAD 早期版本),已跳过 — 在设置可关跳过`);
+    return null;
+  }
+  if (kind === "overlay") {
+    console.warn(`[${MODULE_ID}] overlay 图层 scene: ${sceneName}`);
+    ui.notifications.info(`"${sceneName}" 是图层 scene (透明背景),需配合底图 scene 叠加才能看见完整画面`);
+    // 仍 import
   }
 
   // 只 import scene 真正引用的 journal/playlist/actor, 不创空 stub
@@ -973,6 +1006,11 @@ Hooks.once("init", () => {
     name: "允许玩家浏览",
     hint: "开启后非 GM 也能打开浏览器查看素材 (但仍只有 GM 能导入)",
     scope: "world", config: true, type: Boolean, default: false,
+  });
+  game.settings.register(MODULE_ID, "skipBlankScenes", {
+    name: "跳过空/墙线-only scene",
+    hint: "MAD 等内容包带很多旧版墙线包 (有墙无图) + 占位模板. 默认跳过. 关掉的话仍可手动 import.",
+    scope: "world", config: true, type: Boolean, default: true,
   });
 
   const mod = game.modules.get(MODULE_ID);
