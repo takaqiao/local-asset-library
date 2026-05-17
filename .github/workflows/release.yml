@@ -1,0 +1,74 @@
+name: Local Asset Library Release
+
+env:
+  project_url: 'https://github.com/${{github.repository}}'
+  latest_manifest_url: 'https://github.com/${{github.repository}}/releases/latest/download/module.json'
+  release_module_url: 'https://github.com/${{github.repository}}/releases/download/${{github.event.release.tag_name}}/module.zip'
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  release:
+    types: [published]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate module.json
+        run: |
+          echo "Validating module.json syntax..."
+          cat module.json | jq empty
+          echo "OK"
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [validate]
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Extract Version From Tag
+        id: get_version
+        uses: battila7/get-version-action@v2
+
+      - name: Substitute Manifest Placeholders
+        uses: cschleiden/replace-tokens@v1
+        with:
+          files: 'module.json'
+        env:
+          VERSION: ${{ steps.get_version.outputs.version-without-v }}
+          URL: ${{ env.project_url }}
+          MANIFEST: ${{ env.latest_manifest_url }}
+          DOWNLOAD: ${{ env.release_module_url }}
+
+      - name: Create Module Archive
+        run: |
+          zip --recurse-paths ./module.zip \
+            module.json \
+            README.md \
+            LICENSE \
+            scripts/ \
+            styles/ \
+            templates/
+
+      - name: Update Release With Files
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          name: ${{ github.event.release.name }}
+          draft: ${{ github.event.release.unpublished }}
+          prerelease: ${{ github.event.release.prerelease }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts: './module.json, ./module.zip'
+          tag: ${{ github.event.release.tag_name }}
+          body: ${{ github.event.release.body }}

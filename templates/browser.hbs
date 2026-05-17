@@ -1,0 +1,52 @@
+<div class="lal-root">
+  {{#if isScanning}}
+    <div class="lal-empty">
+      <p><i class="fas fa-spinner fa-spin"></i> 正在扫描素材库...</p>
+      <p style="opacity:0.6;font-size:0.85em">3 万多个 asset 约需 30 秒,按 F12 看进度</p>
+    </div>
+  {{else}}
+    <header class="lal-header">
+      <input class="lal-search" type="text" placeholder="搜文件名或合集..." value="{{searchQuery}}" />
+      <select class="lal-filter-type" title="资产类型">
+        <option value="">全部类型</option>
+        {{#each types}}<option value="{{id}}" {{#if selected}}selected{{/if}}>{{name}} ({{count}})</option>{{/each}}
+      </select>
+      <select class="lal-filter-creator" title="创作者">
+        <option value="">全部创作者</option>
+        {{#each creators}}<option value="{{name}}" {{#if selected}}selected{{/if}}>{{name}} ({{count}})</option>{{/each}}
+      </select>
+      <button type="button" class="lal-scan" title="重新扫描"><i class="fas fa-sync"></i></button>
+    </header>
+
+    <div class="lal-stats">{{total}} 个匹配 · 显示 {{pageStart}}-{{pageEnd}} (第 {{page}}/{{totalPages}} 页)</div>
+
+    <div class="lal-grid">
+      {{#each assets}}
+        <div class="lal-tile" draggable="true" data-url="{{url}}" data-id="{{id}}"
+             data-type="{{typeId}}" data-w="{{imgW}}" data-h="{{imgH}}"
+             data-pack-path="{{packPath}}" data-name="{{baseName}}"
+             title="{{filepath}}&#10;{{pack}} · {{creator}}&#10;{{sizeText}} · {{filesizeKb}}KB">
+          <div class="lal-thumb" style="background-color: {{mainColor}};">
+            {{#if isImage}}<img src="{{url}}" loading="lazy" draggable="false" />{{else}}<span class="lal-type-badge">{{typeName}}</span>{{/if}}
+            {{#if isAnimated}}<span class="lal-anim-badge" title="动图/视频"><i class="fas fa-play-circle"></i></span>{{/if}}
+            <div class="lal-overlay">
+              <div class="lal-menu">
+                <button type="button" class="lal-action-import" title="导入到 Foundry"><i class="fas fa-file-import"></i></button>
+                <button type="button" class="lal-action-preview" title="预览"><i class="fas fa-eye"></i></button>
+                <button type="button" class="lal-action-clipboard" title="复制本地路径"><i class="fas fa-copy"></i></button>
+              </div>
+            </div>
+          </div>
+          <div class="lal-name">{{baseName}}</div>
+          <div class="lal-meta">{{pack}}</div>
+        </div>
+      {{/each}}
+    </div>
+
+    <footer class="lal-footer">
+      <button type="button" class="lal-page-prev">← 上页</button>
+      <span class="lal-page-info">第 {{page}} / {{totalPages}} 页</span>
+      <button type="button" class="lal-page-next">下页 →</button>
+    </footer>
+  {{/if}}
+</div>
