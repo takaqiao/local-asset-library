@@ -1296,8 +1296,8 @@ Hooks.once("init", () => {
 
   game.settings.register(MODULE_ID, "rootSubpath", {
     name: "素材库根路径",
-    hint: "你的素材库文件夹相对 Foundry dataPath 的子路径,例如 assets / library / vault 等任意子目录名.",
-    scope: "world", config: true, type: String, default: "assets",
+    hint: "你的素材库文件夹相对 Foundry dataPath 的子路径。发布的素材包默认根目录是 Hamster,直接解压到 Data/ 即可零配置。",
+    scope: "world", config: true, type: String, default: "Hamster",
   });
   game.settings.register(MODULE_ID, "useFolders", {
     name: "自动按层级建文件夹",
