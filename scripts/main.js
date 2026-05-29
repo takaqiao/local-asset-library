@@ -93,7 +93,7 @@ function makeFolderPath(asset) {
 }
 
 const INDEX_CACHE_FILE = "_lal_index.json";
-const INDEX_VERSION = 3;
+const INDEX_VERSION = 4;   // v4: 新增 ScenePacker (type 98) 冒险包识别
 
 // ---------- Scanner ----------
 class LalScanner {
@@ -176,6 +176,40 @@ class LalScanner {
         let packBrowse;
         try { packBrowse = await FilePicker.browse("data", packDir); }
         catch (e) { console.warn(`[${MODULE_ID}] 跳过 ${packDir}:`, e); continue; }
+
+        // ScenePacker pack 识别: 含 scene-packer.info marker + universe.json + data/
+        // → 注册成单个 type=98 "冒险包" 条目 (不当散素材), 由 importScenePackerPack 整包导入
+        const hasSPMarker = packBrowse.files.some(f => f.endsWith("/scene-packer.info"))
+          && packBrowse.files.some(f => f.endsWith("/universe.json"));
+        if (hasSPMarker) {
+          try {
+            const uniUrl = `${packDir}/universe.json`;
+            const uni = await (await fetch(uniUrl)).json();
+            const counts = uni.counts || {};
+            const coverLocal = uni.cover_image
+              ? `${packDir}/data/assets/${String(uni.cover_image).split("?")[0]}`
+              : null;
+            const packName = decodeURIComponent(packDir.split("/").filter(Boolean).pop());
+            allAssets.push({
+              _id: `sp-${packName}`,
+              _type: 98,
+              _isScenePacker: true,
+              _packPath: packDir,
+              _spSystem: uni.system || null,
+              _spCounts: counts,
+              filepath: packName,
+              name: uni.name && uni.name !== "universe" ? uni.name : packName,
+              pack: { creator: uni.author || creatorDir.split("/").filter(Boolean).pop(), name: packName },
+              filesize: 0,
+              thumb: coverLocal,
+              _thumbLocal: coverLocal,
+            });
+            nMetaFiles++;
+          } catch (e) {
+            console.warn(`[${MODULE_ID}] 读 ScenePacker ${packDir} 失败:`, e);
+          }
+          continue;  // SP pack 不再当散素材扫
+        }
 
         const metaFiles = packBrowse.files.filter(
           f => f.includes("_pack_meta_") && f.endsWith(".json") && !f.includes(INDEX_CACHE_FILE)
@@ -818,10 +852,161 @@ async function addItemToActor(asset, actor) {
   return item;
 }
 
+// ---------- ScenePacker 冒险包导入 ----------
+// 核心 = createDocuments({keepId:true, keepEmbeddedIds:true}) 保留原始 _id
+// → 跨文档引用 (token→actor / note→journal / @UUID / folder 父子) 因 id 不变自动生效.
+// 数据已在本地 (G:\moulinette\Data = dataPath), 素材原地引用零拷贝, 不依赖 scene-packer 模块.
+const SP_IMPORT_ORDER = ["JournalEntry", "RollTable", "Item", "Actor", "Playlist", "Cards", "Macro", "Scene"];
+const SP_ASSET_ROOTS = ["beneos_assets", "modules", "moulinette"];
+
+async function spReadJson(url) {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+// folder 拓扑序建 (父先于子), keepId
+async function spCreateFolders(folderData) {
+  if (!folderData) return 0;
+  const all = Object.values(folderData);
+  const placed = new Set(game.folders.map(f => f.id));
+  const existing = new Set(placed);
+  const ordered = [];
+  let progress = true;
+  while (progress) {
+    progress = false;
+    for (const f of all) {
+      if (placed.has(f._id)) continue;
+      const parent = f.folder || null;
+      // 父=null / 父已就位 / 父根本不在本包(孤儿, 当根) → 可建
+      const parentMissing = parent && !all.some(x => x._id === parent);
+      if (parent === null || placed.has(parent) || parentMissing) {
+        if (parentMissing) f.folder = null;
+        ordered.push(f); placed.add(f._id); progress = true;
+      }
+    }
+  }
+  const fresh = ordered.filter(f => !existing.has(f._id));
+  if (!fresh.length) return 0;
+  try {
+    await Folder.createDocuments(fresh, { keepId: true, render: false });
+  } catch (e) { console.warn(`[${MODULE_ID}] SP folder 建失败:`, e); }
+  return fresh.length;
+}
+
+// 用 assets.json mapping 把文档内相对素材路径改写为本地 dataPath 路径 (策略A 原地引用)
+function spRewriteAssets(doc, mapping, assetsRoot) {
+  const keys = mapping?.[doc._id] || [];
+  if (!keys.length) return doc;
+  // 长 key 先替换, 防短 key 是长 key 的子串导致误替换
+  const sorted = [...keys].sort((a, b) => b.length - a.length);
+  let s = JSON.stringify(doc);
+  for (const key of sorted) {
+    const root = String(key).split("/")[0];
+    if (!SP_ASSET_ROOTS.includes(root)) continue;   // http(s):// / worlds/ 等跳过
+    const local = `${assetsRoot}/${key}`;
+    s = s.split(`"${key}"`).join(`"${local}"`);        // JSON 字符串值
+    s = s.split(`"${key}#`).join(`"${local}#`);         // 带锚点
+    s = s.split(`src="${key}"`).join(`src="${local}"`); // journal 内联 <img>
+    s = s.split(`src='${key}'`).join(`src='${local}'`);
+  }
+  return JSON.parse(s);
+}
+
+async function importScenePackerPack(asset) {
+  if (!game.user?.isGM) { ui.notifications.warn("只有 GM 可以导入冒险包"); return null; }
+  const dir = asset._packPath;
+  const dataDir = `${dir}/data`;
+  const assetsRoot = `${dataDir}/assets`;
+
+  const universe = await spReadJson(`${dir}/universe.json`);
+  if (!universe) { ui.notifications.error("无法读 universe.json"); return null; }
+  const counts = universe.counts || {};
+  const sysOk = !universe.system || universe.system === game.system.id;
+  if (!sysOk) {
+    // V14: DialogV2.confirm 返回 boolean; 旧 Dialog.confirm 已弃用
+    const DV2 = foundry.applications?.api?.DialogV2;
+    const content = `<p>此冒险包是 <b>${universe.system}</b> 系统, 当前世界是 <b>${game.system.id}</b>。</p>`
+      + `<p>继续会导入 <b>场景/日志/播放列表</b>, 但<b>跳过角色/物品</b> (系统不兼容会损坏)。继续?</p>`;
+    let proceed;
+    if (DV2?.confirm) {
+      proceed = await DV2.confirm({ window: { title: "系统不匹配" }, content, defaultYes: false });
+    } else {
+      proceed = await Dialog.confirm({ title: "系统不匹配", content, defaultYes: false });
+    }
+    if (!proceed) return null;
+  }
+
+  ui.notifications.info(`开始导入冒险包: ${asset.name} (${counts.Scene || 0} 场景)...`);
+
+  const folderData = await spReadJson(`${dataDir}/folders.json`);
+  const nFolders = await spCreateFolders(folderData);
+
+  const assetsMeta = await spReadJson(`${dataDir}/assets.json`);
+  const mapping = assetsMeta?.mapping || {};
+
+  const created = {};
+  let totalDocs = 0;
+  for (const type of SP_IMPORT_ORDER) {
+    if (!sysOk && (type === "Actor" || type === "Item")) continue;
+    const docs = await spReadJson(`${dataDir}/${type}.json`);
+    if (!Array.isArray(docs) || !docs.length) continue;
+
+    const cls = (typeof foundry !== "undefined" && foundry.utils?.getDocumentClass)
+      ? foundry.utils.getDocumentClass(type)
+      : CONFIG[type]?.documentClass;
+    if (!cls) continue;
+    const coll = cls.collection ?? game.collections?.get(type);
+
+    const prepared = [];
+    for (let d of docs) {
+      if (!d || !d._id) continue;
+      if (coll?.has?.(d._id)) continue;             // 碰撞跳过 (重复导入不炸)
+      delete d._stats;
+      d = spRewriteAssets(d, mapping, assetsRoot);
+      if (type === "Scene") d.thumb = null;          // 源世界 thumb 路径无效, 让 Foundry 重生成
+      prepared.push(d);
+    }
+    if (!prepared.length) continue;
+    try {
+      const made = await cls.createDocuments(prepared, {
+        keepId: true, keepEmbeddedIds: true, render: false,
+      });
+      created[type] = made;
+      totalDocs += made.length;
+      console.log(`[${MODULE_ID}] SP 导入 ${made.length} 个 ${type}`);
+    } catch (e) {
+      console.error(`[${MODULE_ID}] SP 导入 ${type} 失败:`, e);
+      ui.notifications.warn(`${type} 导入部分失败: ${e.message}`);
+    }
+  }
+
+  // scene 缩略图重生成 (跟单 scene 路径一致, 传 img 源)
+  for (const s of (created.Scene || [])) {
+    try {
+      if (!s.thumb && typeof s.createThumbnail === "function") {
+        const src = pickThumbnailSource(s);
+        const t = src ? await s.createThumbnail({ img: src }) : await s.createThumbnail();
+        if (t?.thumb) await s.update({ thumb: t.thumb });
+      }
+    } catch { /* thumb 失败不致命 */ }
+  }
+
+  const firstScene = (created.Scene || [])[0];
+  ui.notifications.info(`冒险包导入完成: ${totalDocs} 个文档 / ${nFolders} 个文件夹`);
+  if (firstScene) { try { firstScene.sheet?.render?.(false); } catch {} }
+  return firstScene || (created.JournalEntry || [])[0] || null;
+}
+
 async function importAsset(asset, dropPos = null) {
   if (!game.user?.isGM) {
     ui.notifications.warn("只有 GM 可以导入素材");
     return null;
+  }
+  if (asset._isScenePacker || (asset._type ?? asset.type) === 98) {
+    return await importScenePackerPack(asset);
   }
   const at = asset._type ?? asset.type;
   const url = asset._localPath;
@@ -1096,6 +1281,11 @@ class LalBrowser extends Application {
           isSelected: this.selectedIds.has(idStr),
           isFavorite: this.favorites.has(idStr),
           thumbUrl: a._thumbLocal || null,
+          // ScenePacker 冒险包: meta 行显示场景/日志/角色数, 而非文件大小
+          ...(a._isScenePacker ? {
+            isScenePacker: true,
+            spMeta: `冒险包 · ${a._spCounts?.Scene || 0}场景 ${a._spCounts?.JournalEntry || 0}日志 ${a._spCounts?.Actor || 0}角色`,
+          } : {}),
           // scene 健康度: 0 missing = 满,1-3 = 轻微,>3 = 破损
           healthClass: a._health ? (a._health.missing === 0 ? "ok"
                                    : a._health.missing <= 3 ? "minor" : "broken") : null,

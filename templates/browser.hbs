@@ -91,7 +91,7 @@
             {{/unless}}
           </div>
           <div class="lal-name">{{baseName}}</div>
-          <div class="lal-meta">{{pack}}</div>
+          <div class="lal-meta">{{#if isScenePacker}}{{spMeta}}{{else}}{{pack}}{{/if}}</div>
         </div>
       {{/each}}
     </div>
