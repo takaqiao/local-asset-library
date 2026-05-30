@@ -74,8 +74,9 @@
             </label>
           {{/if}}
           <div class="lal-thumb" style="background-color: {{mainColor}};">
-            {{#if thumbUrl}}<img src="{{thumbUrl}}" loading="lazy" draggable="false" onerror="this.style.display='none';this.nextElementSibling.style.display='inline-flex';" /><span class="lal-type-badge" style="display:none">{{typeName}}</span>
-            {{else if isImage}}<img src="{{url}}" loading="lazy" draggable="false" />
+            {{#if thumbUrl}}<img src="{{thumbUrl}}" loading="lazy" draggable="false" onerror="this.style.display='none';this.nextElementSibling.style.display='inline-flex';" /><span class="lal-type-badge{{#if isScenePacker}} lal-sp-badge{{/if}}" style="display:none">{{#if isScenePacker}}<i class="fas fa-book-open"></i> {{baseName}}{{else}}{{typeName}}{{/if}}</span>
+            {{else if isImage}}<img src="{{urlEnc}}" loading="lazy" draggable="false" />
+            {{else if isScenePacker}}<span class="lal-type-badge lal-sp-badge"><i class="fas fa-book-open"></i> {{baseName}}</span>
             {{else}}<span class="lal-type-badge">{{typeName}}</span>{{/if}}
             {{#if isAnimated}}<span class="lal-anim-badge" title="动图/视频"><i class="fas fa-play-circle"></i></span>{{/if}}
             {{#if healthClass}}<span class="lal-health-badge lal-health-{{healthClass}}" title="{{#unless healthMissing}}所有 {{healthTotal}} 个 tile 都在本地{{else}}缺 {{healthMissing}}/{{healthTotal}} 个 tile{{/unless}}"><i class="fas fa-{{healthIcon}}"></i></span>{{/if}}

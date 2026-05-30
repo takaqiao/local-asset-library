@@ -167,6 +167,13 @@
   color: rgba(255, 255, 255, 0.9);
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
 }
+/* 冒险包占位 (无封面/封面 404 时显示书本图标 + 包名, 不再裸露类型词) */
+.lal-root .lal-sp-badge {
+  display: inline-flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 6px; text-align: center; line-height: 1.2;
+  word-break: break-word; color: #ffcf8f;
+}
+.lal-root .lal-sp-badge i { font-size: 1.6em; opacity: 0.85; }
 .lal-root .lal-anim-badge {
   position: absolute; top: 4px; right: 4px;
   background: rgba(0,0,0,0.6); color: #ff6;
@@ -194,7 +201,8 @@
   display: flex; align-items: center; justify-content: center;
   pointer-events: none; z-index: 8;
 }
-.lal-root .lal-thumb:hover .lal-overlay { opacity: 1; }
+.lal-root .lal-thumb:hover .lal-overlay,
+.lal-root .lal-thumb:focus-within .lal-overlay { opacity: 1; }   /* 键盘聚焦也露出操作按钮 (focus 可见) */
 .lal-root .lal-overlay .lal-menu {
   display: flex; gap: 6px;
   pointer-events: auto;

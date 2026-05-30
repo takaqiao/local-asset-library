@@ -22,7 +22,7 @@ const AT_NAMES_CN = {
   1: "场景", 2: "地图", 3: "图片", 4: "PDF", 5: "角色",
   6: "物品", 7: "音频", 8: "日志", 9: "播放列表",
   10: "宏", 11: "随机表", 12: "冒险",
-  97: "图标", 98: "ScenePacker", 99: "未知",
+  97: "图标", 98: "冒险包", 99: "未知",
 };
 
 const DOC_CLASS_BY_TYPE = {
@@ -47,6 +47,31 @@ function isVideoUrl(url) {
   return /\.(webm|mp4|m4v|ogv)(\?|$)/i.test(url);
 }
 
+// 转义本地路径里会破坏 URL 解析的保留字符 (主要是 #).
+// fetch / <img src> 把 # 当成 fragment 分隔符, 路径在 # 处被截断 → 404
+// (如 animatedmaps 的 "UNDERGROUND RIVER #1-1/..."). 空格/[]/中文由 URL 解析器自动处理,
+// 只需补 # 和 ?. 幂等安全 (已转义的 %23 不含裸 #, 不会二次编码), 在"使用点"调用, 不动存储的原始路径.
+function encURL(p) {
+  if (!p) return p;
+  return String(p).replace(/#/g, "%23").replace(/\?/g, "%3F");
+}
+
+// 有界并发池: 同时最多 limit 个 worker 在跑, 共享游标依次领 items. 返回与 items 对齐的结果数组,
+// 单个 worker 抛错记 null 不影响其余 (扫描里大量独立的 FilePicker.browse / fetch 往返靠这个并行).
+async function pool(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const run = async () => {
+    while (cursor < items.length) {
+      const i = cursor++;
+      try { results[i] = await worker(items[i], i); }
+      catch { results[i] = null; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length || 1) }, run));
+  return results;
+}
+
 function safeJsonParse(text, ctx = "") {
   try { return JSON.parse(text); }
   catch (e) {
@@ -56,30 +81,43 @@ function safeJsonParse(text, ctx = "") {
 }
 
 // ---------- Folder 管理 ----------
+// 同名 Folder.create 不会被 Foundry 拒绝 (允许重名), 两个并发 import (拖拽撞点击) 会各建一棵重复树.
+// 用 in-flight Promise map 把"同 type+父+名"的并发建文件夹归并成一次.
+const _folderInflight = new Map();
+
 async function getOrCreateFolder(docType, pathSegments) {
   if (!game.settings.get(MODULE_ID, "useFolders")) return null;
   if (!Array.isArray(pathSegments) || pathSegments.length === 0) return null;
 
+  const findFolder = (segment, parent) => game.folders.find(
+    f => f.type === docType && f.name === segment &&
+         (f.folder?.id || null) === (parent?.id || null)
+  );
+
   let parent = null;
   for (const segment of pathSegments) {
     if (!segment) continue;
-    let folder = game.folders.find(
-      f => f.type === docType && f.name === segment &&
-           (f.folder?.id || null) === (parent?.id || null)
-    );
+    let folder = findFolder(segment, parent);
     if (!folder) {
-      try {
-        folder = await Folder.create({
-          name: segment, type: docType, color: FOLDER_COLOR,
-          folder: parent?.id || null,
-        });
-      } catch (e) {
-        folder = game.folders.find(
-          f => f.type === docType && f.name === segment &&
-               (f.folder?.id || null) === (parent?.id || null)
-        );
-        if (!folder) throw e;
+      const key = `${docType}|${parent?.id || "root"}|${segment}`;
+      let promise = _folderInflight.get(key);
+      if (!promise) {
+        const parentId = parent?.id || null;
+        promise = (async () => {
+          try {
+            return await Folder.create({
+              name: segment, type: docType, color: FOLDER_COLOR, folder: parentId,
+            }, { render: false });
+          } catch (e) {
+            const existing = findFolder(segment, { id: parentId });
+            if (existing) return existing;
+            throw e;
+          }
+        })();
+        _folderInflight.set(key, promise);
+        promise.finally(() => _folderInflight.delete(key));
       }
+      folder = await promise;
     }
     parent = folder;
   }
@@ -150,9 +188,88 @@ class LalScanner {
     } catch { return null; }
   }
 
+  // 扫一个 pack 目录 → 返回该 pack 的 asset 数组 (SP 包是单条 type98, 散素材包是逐条).
+  // 同 pack 内的 _id 去重 (一张 scene 常同时出现在 _pack_meta_type1[场景] 和 type2[地图] 里,
+  // 内容字节相同; 按 type 升序处理 → 保留 Scene(1) 那条, 丢弃 Map(2) 重复, 避免收藏/多选互相串台).
+  async _scanPack(creatorDir, packDir) {
+    let packBrowse;
+    try { packBrowse = await FilePicker.browse("data", packDir); }
+    catch (e) { this._stats.nPackErr++; console.warn(`[${MODULE_ID}] 跳过 ${packDir}:`, e); return []; }
+
+    // ScenePacker pack 识别: 含 scene-packer.info marker + universe.json + data/
+    const hasSPMarker = packBrowse.files.some(f => f.endsWith("/scene-packer.info"))
+      && packBrowse.files.some(f => f.endsWith("/universe.json"));
+    if (hasSPMarker) {
+      try {
+        const uni = await (await fetch(encURL(`${packDir}/universe.json`))).json();
+        const counts = uni.counts || {};
+        const coverLocal = uni.cover_image
+          ? `${packDir}/data/assets/${String(uni.cover_image).split("?")[0]}`
+          : null;
+        const packName = decodeURIComponent(packDir.split("/").filter(Boolean).pop());
+        return [{
+          _id: `sp-${packName}`,
+          _type: 98,
+          _isScenePacker: true,
+          _packPath: packDir,
+          _spSystem: uni.system || null,
+          _spCounts: counts,
+          filepath: packName,
+          name: uni.name && uni.name !== "universe" ? uni.name : packName,
+          pack: { creator: uni.author || creatorDir.split("/").filter(Boolean).pop(), name: packName },
+          filesize: 0,
+          thumb: coverLocal,
+          _thumbLocal: coverLocal,
+        }];
+      } catch (e) {
+        this._stats.nMetaErr++;
+        console.warn(`[${MODULE_ID}] 读 ScenePacker ${packDir} 失败:`, e);
+        return [];
+      }
+    }
+
+    const metaFiles = packBrowse.files.filter(
+      f => f.includes("_pack_meta_") && f.endsWith(".json") && !f.includes(INDEX_CACHE_FILE)
+    );
+    if (!metaFiles.length) return [];
+
+    // 并行拉同一个 pack 的所有 meta, 再按 type 升序合并 (保证 _id 去重的胜者确定 = 小 type)
+    const metas = await Promise.all(metaFiles.map(async (metaFile) => {
+      try { return await (await fetch(encURL(metaFile))).json(); }
+      catch (e) { this._stats.nMetaErr++; console.warn(`[${MODULE_ID}] 读 ${metaFile} 失败:`, e); return null; }
+    }));
+    metas.sort((a, b) => ((a?.type ?? 99) - (b?.type ?? 99)));
+
+    const out = [];
+    const seen = new Set();
+    for (const meta of metas) {
+      if (!meta) continue;
+      this._stats.nMetaFiles++;
+      const type = meta.type;
+      for (const asset of (meta.assets || [])) {
+        if (asset._id != null) {
+          if (seen.has(asset._id)) continue;   // 同 pack 内 _id 去重
+          seen.add(asset._id);
+        }
+        let thumbLocal = null;
+        if (asset.thumb) {
+          const pathPart = String(asset.thumb).split("?")[0];
+          if (pathPart) thumbLocal = `${packDir}/${pathPart}`;
+        }
+        out.push({
+          ...asset,
+          _localPath: `${packDir}/${asset.filepath}`,
+          _packPath: packDir,
+          _type: asset.type ?? type,    // 优先内层 type, 缺省回退 meta 文件 type
+          _thumbLocal: thumbLocal,
+        });
+      }
+    }
+    return out;
+  }
+
   async scan(onProgress = null) {
-    const allAssets = [];
-    let nCreators = 0, nPacks = 0, nMetaFiles = 0;
+    this._stats = { nPackErr: 0, nMetaErr: 0, nMetaFiles: 0 };
 
     let root;
     try {
@@ -160,90 +277,30 @@ class LalScanner {
     } catch (e) {
       console.error(`[${MODULE_ID}] 无法浏览 ${this.rootSubpath}:`, e);
       ui.notifications.error(`找不到 ${this.rootSubpath}/. 请在模块设置里改根路径.`);
-      return allAssets;
+      return [];
     }
 
-    for (const creatorDir of root.dirs) {
-      nCreators++;
-      onProgress?.(`扫描创作者 ${nCreators}: ${creatorDir.split("/").pop()}`);
-
-      let packsBrowse;
-      try { packsBrowse = await FilePicker.browse("data", creatorDir); }
-      catch (e) { console.warn(`[${MODULE_ID}] 跳过 ${creatorDir}:`, e); continue; }
-
-      for (const packDir of packsBrowse.dirs) {
-        nPacks++;
-        let packBrowse;
-        try { packBrowse = await FilePicker.browse("data", packDir); }
-        catch (e) { console.warn(`[${MODULE_ID}] 跳过 ${packDir}:`, e); continue; }
-
-        // ScenePacker pack 识别: 含 scene-packer.info marker + universe.json + data/
-        // → 注册成单个 type=98 "冒险包" 条目 (不当散素材), 由 importScenePackerPack 整包导入
-        const hasSPMarker = packBrowse.files.some(f => f.endsWith("/scene-packer.info"))
-          && packBrowse.files.some(f => f.endsWith("/universe.json"));
-        if (hasSPMarker) {
-          try {
-            const uniUrl = `${packDir}/universe.json`;
-            const uni = await (await fetch(uniUrl)).json();
-            const counts = uni.counts || {};
-            const coverLocal = uni.cover_image
-              ? `${packDir}/data/assets/${String(uni.cover_image).split("?")[0]}`
-              : null;
-            const packName = decodeURIComponent(packDir.split("/").filter(Boolean).pop());
-            allAssets.push({
-              _id: `sp-${packName}`,
-              _type: 98,
-              _isScenePacker: true,
-              _packPath: packDir,
-              _spSystem: uni.system || null,
-              _spCounts: counts,
-              filepath: packName,
-              name: uni.name && uni.name !== "universe" ? uni.name : packName,
-              pack: { creator: uni.author || creatorDir.split("/").filter(Boolean).pop(), name: packName },
-              filesize: 0,
-              thumb: coverLocal,
-              _thumbLocal: coverLocal,
-            });
-            nMetaFiles++;
-          } catch (e) {
-            console.warn(`[${MODULE_ID}] 读 ScenePacker ${packDir} 失败:`, e);
-          }
-          continue;  // SP pack 不再当散素材扫
-        }
-
-        const metaFiles = packBrowse.files.filter(
-          f => f.includes("_pack_meta_") && f.endsWith(".json") && !f.includes(INDEX_CACHE_FILE)
-        );
-
-        for (const metaFile of metaFiles) {
-          nMetaFiles++;
-          try {
-            const resp = await fetch(metaFile);
-            const meta = await resp.json();
-            const type = meta.type;
-            for (const asset of (meta.assets || [])) {
-              const localFile = `${packDir}/${asset.filepath}`;
-              // 抽 thumb 路径: metadata.thumb = "json/scene/X_thumb.webp?sig=..."
-              // 去掉 SAS 查询串, 拼成本地路径; 文件可能不存在,UI 用 onerror 兜底
-              let thumbLocal = null;
-              if (asset.thumb) {
-                const pathPart = String(asset.thumb).split("?")[0];
-                if (pathPart) thumbLocal = `${packDir}/${pathPart}`;
-              }
-              allAssets.push({
-                ...asset,
-                _localPath: localFile,
-                _packPath: packDir,
-                _type: type,
-                _thumbLocal: thumbLocal,
-              });
-            }
-          } catch (e) {
-            console.warn(`[${MODULE_ID}] 读 ${metaFile} 失败:`, e);
-          }
-        }
-      }
+    // 阶段1: 并行 browse 每个创作者目录 → 摊平成 (creatorDir, packDir) 任务表
+    onProgress?.(`枚举 ${root.dirs.length} 个创作者...`);
+    const creatorBrowses = await pool(root.dirs, 12, async (creatorDir) => {
+      try { return { creatorDir, packs: (await FilePicker.browse("data", creatorDir)).dirs }; }
+      catch (e) { this._stats.nPackErr++; console.warn(`[${MODULE_ID}] 跳过 ${creatorDir}:`, e); return null; }
+    });
+    const packJobs = [];
+    for (const cb of creatorBrowses) {
+      if (!cb) continue;
+      for (const packDir of cb.packs) packJobs.push([cb.creatorDir, packDir]);
     }
+
+    // 阶段2: 有界并发逐 pack 扫 (每个任务: browse pack + 并行拉 meta), 顺序无关查询时再排序
+    onProgress?.(`发现 ${packJobs.length} 个合集, 并行扫描中...`);
+    let done = 0;
+    const perPack = await pool(packJobs, 16, async ([creatorDir, packDir]) => {
+      const r = await this._scanPack(creatorDir, packDir);
+      if ((++done % 250) === 0) onProgress?.(`已扫 ${done}/${packJobs.length} 合集...`);
+      return r;
+    });
+    const allAssets = perPack.flat();
 
     // 合并 health 数据到 scene 类型 asset 上
     const health = await this.loadHealth();
@@ -258,7 +315,7 @@ class LalScanner {
       console.log(`[${MODULE_ID}] health 合并到 ${merged} 个 scene`);
     }
 
-    onProgress?.(`完成: ${allAssets.length} 个 asset / ${nPacks} 个合集 / ${nMetaFiles} 个 metadata`);
+    onProgress?.(`完成: ${allAssets.length} 个 asset / ${packJobs.length} 个合集 / ${this._stats.nMetaFiles} 个 metadata`);
     return allAssets;
   }
 }
@@ -269,6 +326,7 @@ class LalIndex {
     this.assets = assets;
     this.byType = new Map();
     this.byCreator = new Map();
+    this.byId = new Map();   // String(_id) → asset, 首条胜 (与旧 find 的 first-wins 语义一致)
     this._buildLookups();
   }
 
@@ -280,8 +338,13 @@ class LalIndex {
       this.byType.get(t).push(a);
       if (!this.byCreator.has(c)) this.byCreator.set(c, []);
       this.byCreator.get(c).push(a);
+      const id = String(a._id);
+      if (!this.byId.has(id)) this.byId.set(id, a);
     }
   }
+
+  /** O(1) 按 id 取 asset, 替代全表 find */
+  getById(id) { return this.byId.get(String(id)) || null; }
 
   search({ query = "", types = null, creators = null, packs = null, folderPrefix = null,
            favoritesOnly = false, favorites = null, sort = "name-asc" }) {
@@ -340,7 +403,7 @@ class LalIndex {
 
 // ---------- 单 asset 导入 ----------
 async function fetchAndRewrite(url, packPath) {
-  const resp = await fetch(url);
+  const resp = await fetch(encURL(url));
   if (!resp.ok) throw new Error(`fetch ${url}: ${resp.status}`);
   let text = await resp.text();
   const depCount = (text.match(/#DEP#/g) || []).length;
@@ -538,6 +601,12 @@ async function importSceneJSON(text, asset) {
   const folder = await getOrCreateFolder("Scene", makeFolderPath(asset));
   if (folder) parsed.folder = folder.id;
 
+  // keepId create 对顶层世界文档是静默 upsert: 若已有同 _id 文档会被覆盖. 撞 id 则丢 _id 生成新的.
+  if (parsed._id && game.collections?.get("Scene")?.get?.(parsed._id)) {
+    console.warn(`[${MODULE_ID}] 世界已存在 Scene ${parsed._id}, 改用新 id 避免覆盖`);
+    delete parsed._id;
+  }
+
   const docData = await cls.fromImport(parsed);
 
   let scene;
@@ -554,9 +623,9 @@ async function importSceneJSON(text, asset) {
     // 优先: download-thumbs.py 下到的 server thumb (asset.thumb 字段), 直接 set 不用 render
     if (asset?._thumbLocal) {
       try {
-        const probe = await fetch(asset._thumbLocal, { method: "HEAD" });
+        const probe = await fetch(encURL(asset._thumbLocal), { method: "HEAD" });
         if (probe.ok) {
-          await scene.update({ thumb: asset._thumbLocal });
+          await scene.update({ thumb: encURL(asset._thumbLocal) });
           console.log(`[${MODULE_ID}] thumb 直接用 server-gen: ${asset._thumbLocal.split("/").pop()}`);
         } else {
           throw new Error(`thumb 404`);
@@ -608,6 +677,10 @@ async function importDocByClass(text, docName, asset) {
   delete data._stats;
   const folder = await getOrCreateFolder(docName, makeFolderPath(asset));
   if (folder) data.folder = folder.id;
+  if (data._id && game.collections?.get(docName)?.get?.(data._id)) {
+    console.warn(`[${MODULE_ID}] 世界已存在 ${docName} ${data._id}, 改用新 id 避免覆盖`);
+    delete data._id;
+  }
   const docData = await cls.fromImport(data);
 
   let created;
@@ -682,20 +755,24 @@ async function addOrToggleAudio(url, asset) {
   // Moulinette 用 AudioHelper.inputToVolume 把 input slider 0-1 转 perceptual log scale
   const volume = (foundry.audio?.AudioHelper?.inputToVolume?.(rawVolume))
     ?? (AudioHelper?.inputToVolume?.(rawVolume)) ?? rawVolume;
+  const path = encURL(url);
   let playlist = game.playlists.find(p => p.name === PLAYLIST_NAME);
   if (!playlist) {
     playlist = await Playlist.create({ name: PLAYLIST_NAME, mode: -1 });
   }
-  const existing = playlist.sounds.find(s => s.path === url);
+  const existing = playlist.sounds.find(s => s.path === path);
   if (existing) {
+    // updateEmbeddedDocuments 在 await 内就地改了 existing.playing, await 后它已是新值;
+    // 先存目标态再返回, 否则 toast 会显示反的状态.
+    const next = !existing.playing;
     await playlist.updateEmbeddedDocuments("PlaylistSound", [{
-      _id: existing.id, playing: !existing.playing,
+      _id: existing.id, playing: next,
     }]);
-    return { playlist, toggled: true, playing: !existing.playing };
+    return { playlist, toggled: true, playing: next };
   }
   const soundName = asset?.filepath?.split("/").pop()?.replace(/\.[^.]+$/, "") || "Sound";
   const [created] = await playlist.createEmbeddedDocuments("PlaylistSound", [{
-    name: soundName, path: url, channel, volume, playing: true,
+    name: soundName, path, channel, volume, playing: true,
   }]);
   ui.playlists?.activate();
   return { playlist, sound: created, added: true };
@@ -717,7 +794,7 @@ async function createTileFromAsset(asset, dropPos) {
   const x = cx - w / 2;
   const y = cy - h / 2;
   const tileData = {
-    texture: { src: url },
+    texture: { src: encURL(url) },
     x, y, width: w, height: h,
     rotation: 0, sort: 0, hidden: false, locked: false,
   };
@@ -746,7 +823,7 @@ async function createNoteFromImage(asset, dropPos) {
   }
   const [note] = await canvas.scene.createEmbeddedDocuments("Note", [{
     entryId: journal.id, x: cx, y: cy,
-    icon: asset._localPath, iconSize: 64, text: name,
+    icon: encURL(asset._localPath), iconSize: 64, text: name,
   }]);
   return note;
 }
@@ -779,8 +856,8 @@ async function createTokenFromImage(asset, dropPos) {
             const folder = await getOrCreateFolder("Actor", makeFolderPath(asset));
             const actor = await Actor.create({
               name: nm, type: at, folder: folder?.id || null,
-              img: asset._localPath,
-              prototypeToken: { name: nm, texture: { src: asset._localPath } },
+              img: encURL(asset._localPath),
+              prototypeToken: { name: nm, texture: { src: encURL(asset._localPath) } },
             });
             const sceneGrid = canvas.grid?.size || 100;
             let cx = dropPos?.x ?? canvas.dimensions.width / 2;
@@ -804,6 +881,7 @@ async function createTokenFromImage(asset, dropPos) {
 
 /** Sidebar drop: 图 → Scene 侧栏 = 用此图建新 Scene */
 async function createSceneFromImage(asset) {
+  if (!game.user?.isGM) { ui.notifications.warn("只有 GM 可以导入素材"); return null; }
   const name = asset?.name || asset?.filepath?.split("/").pop()?.replace(/\.[^.]+$/, "") || "新场景";
   const w = (asset.size?.width || 0) > 0 ? asset.size.width : 4000;
   const h = (asset.size?.height || 0) > 0 ? asset.size.height : 3000;
@@ -811,12 +889,12 @@ async function createSceneFromImage(asset) {
   const scene = await Scene.create({
     name, folder: folder?.id || null,
     width: w, height: h, padding: 0.25,
-    background: { src: asset._localPath },
+    background: { src: encURL(asset._localPath) },
     grid: { size: 100 },
   });
   // 生成 thumb
   try {
-    const t = await scene.createThumbnail({ img: asset._localPath });
+    const t = await scene.createThumbnail({ img: encURL(asset._localPath) });
     if (t?.thumb) await scene.update({ thumb: t.thumb });
   } catch {}
   await scene.view();
@@ -827,6 +905,7 @@ async function createSceneFromImage(asset) {
 
 /** Sidebar drop: 音频 → Playlist 侧栏 = 加入指定 Playlist */
 async function addAudioToSpecificPlaylist(asset, playlistId) {
+  if (!game.user?.isGM) { ui.notifications.warn("只有 GM 可以导入素材"); return null; }
   const playlist = game.playlists.get(playlistId);
   if (!playlist) throw new Error(`找不到 playlist ${playlistId}`);
   const channel = game.settings.get(MODULE_ID, "audioChannel");
@@ -835,7 +914,7 @@ async function addAudioToSpecificPlaylist(asset, playlistId) {
     ?? (AudioHelper?.inputToVolume?.(rawVolume)) ?? rawVolume;
   const name = asset?.name || asset?.filepath?.split("/").pop()?.replace(/\.[^.]+$/, "") || "Sound";
   const [s] = await playlist.createEmbeddedDocuments("PlaylistSound", [{
-    name, path: asset._localPath, channel, volume,
+    name, path: encURL(asset._localPath), channel, volume,
   }]);
   ui.notifications.info(`已加入 "${playlist.name}": ${name}`);
   return s;
@@ -843,6 +922,7 @@ async function addAudioToSpecificPlaylist(asset, playlistId) {
 
 /** Sidebar drop: Item → Actor sheet/sidebar */
 async function addItemToActor(asset, actor) {
+  if (!game.user?.isGM) { ui.notifications.warn("只有 GM 可以导入素材"); return null; }
   const text = await fetchAndRewrite(asset._localPath, asset._packPath);
   const data = safeJsonParse(text, asset._localPath);
   delete data._stats;
@@ -949,6 +1029,7 @@ async function importScenePackerPack(asset) {
 
   const created = {};
   let totalDocs = 0;
+  let nTypeFail = 0;
   for (const type of SP_IMPORT_ORDER) {
     if (!sysOk && (type === "Actor" || type === "Item")) continue;
     const docs = await spReadJson(`${dataDir}/${type}.json`);
@@ -978,6 +1059,7 @@ async function importScenePackerPack(asset) {
       totalDocs += made.length;
       console.log(`[${MODULE_ID}] SP 导入 ${made.length} 个 ${type}`);
     } catch (e) {
+      nTypeFail++;
       console.error(`[${MODULE_ID}] SP 导入 ${type} 失败:`, e);
       ui.notifications.warn(`${type} 导入部分失败: ${e.message}`);
     }
@@ -994,8 +1076,17 @@ async function importScenePackerPack(asset) {
     } catch { /* thumb 失败不致命 */ }
   }
 
+  // 宏来自未校验的冒险包, 是可执行代码 (当前数据集里都是空的, 但仍提示). 跑之前自行检查.
+  const nMacros = (created.Macro || []).length;
+  if (nMacros > 0) {
+    ui.notifications.warn(`已导入 ${nMacros} 个宏 (来自冒险包, 含可执行代码, 运行前请自行检查)`);
+  }
   const firstScene = (created.Scene || [])[0];
-  ui.notifications.info(`冒险包导入完成: ${totalDocs} 个文档 / ${nFolders} 个文件夹`);
+  if (nTypeFail > 0) {
+    ui.notifications.warn(`冒险包导入完成 (${nTypeFail} 类部分失败, 详见 F12): ${totalDocs} 个文档 / ${nFolders} 个文件夹`);
+  } else {
+    ui.notifications.info(`冒险包导入完成: ${totalDocs} 个文档 / ${nFolders} 个文件夹`);
+  }
   if (firstScene) { try { firstScene.sheet?.render?.(false); } catch {} }
   return firstScene || (created.JournalEntry || [])[0] || null;
 }
@@ -1148,7 +1239,12 @@ class LalBrowser extends Application {
       const assets = await scanner.scan(m => console.log(`[${MODULE_ID}] ${m}`));
       const idx = new LalIndex(assets);
       game.modules.get(MODULE_ID).api.index = idx;
-      ui.notifications.info(`已索引 ${assets.length} 个 asset / ${idx.byCreator.size} 个创作者 / ${idx.byType.size} 种类型`);
+      const st = scanner._stats || {};
+      if ((st.nPackErr || 0) + (st.nMetaErr || 0) > 0) {
+        ui.notifications.warn(`已索引 ${assets.length} 个 asset (跳过 ${st.nPackErr || 0} 个合集 / ${st.nMetaErr || 0} 个 metadata 读取失败, 详见 F12)`);
+      } else {
+        ui.notifications.info(`已索引 ${assets.length} 个 asset / ${idx.byCreator.size} 个创作者 / ${idx.byType.size} 种类型`);
+      }
       // 3) 落盘缓存
       await scanner.saveCached(assets);
     } catch (e) {
@@ -1226,10 +1322,11 @@ class LalBrowser extends Application {
       packOptions = [...seen.entries()].sort((a, b) => a[0].localeCompare(b[0]))
         .map(([name, count]) => ({ name, count, selected: name === this.filterPack }));
     }
+    const totalPages = Math.max(1, Math.ceil(results.length / this.pageSize));
+    this.page = Math.min(Math.max(this.page, 0), totalPages - 1);   // 翻过头/筛选变化越界 → 夹回末页
     const pageStart = this.page * this.pageSize;
     const pageEnd = Math.min(pageStart + this.pageSize, results.length);
     const pageAssets = results.slice(pageStart, pageEnd);
-    const totalPages = Math.max(1, Math.ceil(results.length / this.pageSize));
 
     return {
       total: results.length, page: this.page + 1, totalPages,
@@ -1269,7 +1366,8 @@ class LalBrowser extends Application {
           creator: a.pack?.creator || "",
           typeId: tid,
           typeName: AT_NAMES_CN[tid] || `T${tid}`,
-          url: a._localPath,
+          url: a._localPath,                          // 原始本地路径 (拖拽/复制/data-url 用)
+          urlEnc: encURL(a._localPath),               // 转义后给 <img src> (避免 # 截断)
           packPath: a._packPath,
           mainColor: a.main_color ? `#${a.main_color.substring(0, 6)}` : "#444",
           sizeText: a.size ? `${a.size.width}×${a.size.height}` : "",
@@ -1280,7 +1378,7 @@ class LalBrowser extends Application {
           isAnimated,
           isSelected: this.selectedIds.has(idStr),
           isFavorite: this.favorites.has(idStr),
-          thumbUrl: a._thumbLocal || null,
+          thumbUrl: a._thumbLocal ? encURL(a._thumbLocal) : null,
           // ScenePacker 冒险包: meta 行显示场景/日志/角色数, 而非文件大小
           ...(a._isScenePacker ? {
             isScenePacker: true,
@@ -1386,7 +1484,7 @@ class LalBrowser extends Application {
       ui.notifications.info(`开始批量导入 ${ids.length} 个素材...`);
       let ok = 0, fail = 0;
       for (const id of ids) {
-        const asset = this.index.assets.find(a => String(a._id) === id);
+        const asset = this.index.getById(id);
         if (!asset) { fail++; continue; }
         try {
           await importAsset(asset, null);
@@ -1420,7 +1518,7 @@ class LalBrowser extends Application {
     html.find(".lal-action-import").on("click", safe(async (ev) => {
       const tile = ev.currentTarget.closest(".lal-tile");
       const assetId = String(tile?.dataset.id ?? "");
-      const asset = this.index.assets.find(a => String(a._id) === assetId);
+      const asset = this.index.getById(assetId);
       if (asset) await importAsset(asset, null);
       else console.warn(`[${MODULE_ID}] 找不到 asset ${assetId}`);
     }));
@@ -1437,6 +1535,7 @@ class LalBrowser extends Application {
       const url = tile?.dataset.url;
       const tid = Number(tile?.dataset.type);
       if (!url) return;
+      const playUrl = encURL(url);   // <audio>/<img> 要转义后的路径 (# 否则截断)
       if (tid === 7) {
         let audioEl = document.getElementById("lal-audio-preview");
         if (!audioEl) {
@@ -1444,17 +1543,19 @@ class LalBrowser extends Application {
           audioEl.id = "lal-audio-preview";
           document.body.appendChild(audioEl);
         }
-        if (audioEl.src === new URL(url, location.href).href && !audioEl.paused) {
+        if (audioEl.src === new URL(playUrl, location.href).href && !audioEl.paused) {
           audioEl.pause();
           ui.notifications.info("音频已停止");
         } else {
-          audioEl.src = url;
+          audioEl.src = playUrl;
           audioEl.volume = Number(game.settings.get(MODULE_ID, "audioVolume"));
           audioEl.play();
           ui.notifications.info("音频播放中");
         }
       } else if (tid === 3 || tid === 2) {
-        new ImagePopout(url, { title: tile?.dataset.name || "预览" }).render(true);
+        // V14: ImagePopout 是 ApplicationV2, 取单个 options 对象 ({src, window:{title}}), 不再是 (src, opts)
+        const ImagePopoutCls = foundry.applications?.apps?.ImagePopout ?? globalThis.ImagePopout;
+        new ImagePopoutCls({ src: playUrl, window: { title: tile?.dataset.name || "预览" } }).render(true);
       } else {
         ui.notifications.warn(`类型 ${tid} 暂不支持预览`);
       }
@@ -1575,12 +1676,17 @@ Hooks.on("getSceneControlButtons", (controls) => {
   if (!_userCanBrowse()) return;
   const tilesControl = Array.isArray(controls)
     ? controls.find(c => c.name === "tiles")
-    : (controls.tiles || controls.tile);
+    : controls.tiles;
   if (!tilesControl) return;
+  // V14 的 SceneControlTool 把 order 列为必填; 排在现有工具之后
+  const toolCount = Array.isArray(tilesControl.tools)
+    ? tilesControl.tools.length
+    : Object.keys(tilesControl.tools ?? {}).length;
   const button = {
     name: "localAssetLibrary",
     title: "本地素材库",
     icon: "fas fa-photo-film",
+    order: toolCount,
     button: true, visible: true,
     onChange: () => game.modules.get(MODULE_ID).api.openBrowser(),
   };
@@ -1612,7 +1718,7 @@ Hooks.on("dropCanvasData", (canvas, data) => {
     ui.notifications.error("索引未建立,请先打开素材库");
     return false;
   }
-  const asset = idx.assets.find(a => String(a._id) === String(data.assetId));
+  const asset = idx.getById(data.assetId);
   if (!asset) {
     console.warn(`[${MODULE_ID}] 找不到 asset ${data.assetId}`);
     return false;
@@ -1631,7 +1737,7 @@ Hooks.on("dropCanvasData", (canvas, data) => {
 Hooks.on("dropActorSheetData", (actor, sheet, data) => {
   if (data?.type !== "local-asset-library") return true;
   const idx = game.modules.get(MODULE_ID).api.index;
-  const asset = idx?.assets.find(a => String(a._id) === String(data.assetId));
+  const asset = idx?.getById(data.assetId);
   if (!asset || (asset._type ?? asset.type) !== 6) return true;
   addItemToActor(asset, actor).catch(e => {
     console.error(`[${MODULE_ID}] item→actor 失败:`, e);
@@ -1650,7 +1756,7 @@ Hooks.on("renderPlaylistDirectory", (app, html) => {
     let data; try { data = JSON.parse(dt.getData("text/plain")); } catch { return; }
     if (data?.type !== "local-asset-library") return;
     const idx = game.modules.get(MODULE_ID).api.index;
-    const asset = idx?.assets.find(a => String(a._id) === String(data.assetId));
+    const asset = idx?.getById(data.assetId);
     if (!asset || (asset._type ?? asset.type) !== 7) return;
     const playlistId = ev.currentTarget.dataset.entryId || ev.currentTarget.dataset.documentId;
     if (!playlistId) return;
@@ -1670,7 +1776,7 @@ Hooks.on("renderSceneDirectory", (app, html) => {
     let data; try { data = JSON.parse(dt.getData("text/plain")); } catch { return; }
     if (data?.type !== "local-asset-library") return;
     const idx = game.modules.get(MODULE_ID).api.index;
-    const asset = idx?.assets.find(a => String(a._id) === String(data.assetId));
+    const asset = idx?.getById(data.assetId);
     if (!asset) return;
     const at = asset._type ?? asset.type;
     if (at !== 3 && at !== 2) return;
